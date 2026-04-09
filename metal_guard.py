@@ -71,7 +71,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, TypeVar
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 log = logging.getLogger("metal_guard")
 
@@ -82,6 +82,7 @@ T = TypeVar("T")
 _METAL_OOM_PATTERN = re.compile(
     r"Command buffer execution failed.*Insufficient Memory"
     r"|kIOGPUCommandBufferCallbackErrorOutOfMemory",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
@@ -179,12 +180,13 @@ class MetalGuard:
         breadcrumb_path: str | None = "logs/metal_breadcrumb.log",
     ) -> None:
         self._threads: list[threading.Thread] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # Reentrant — safe if cleanup calls nest
         self._cooldown = cooldown_secs
         self._thread_timeout = thread_timeout_secs
         self._breadcrumb_path = breadcrumb_path
         self._flush_timer: threading.Timer | None = None
         self._flush_interval: float = 0
+        self._tick_fn: Callable[[], None] = self._periodic_flush_tick
         self._watchdog_warn_pct: float = 70.0
         self._watchdog_critical_pct: float = 85.0
         self._watchdog_on_critical: Callable[[], None] | None = None
@@ -208,7 +210,7 @@ class MetalGuard:
 
         Returns the number of threads still alive after timeout (0 = clean).
         """
-        timeout = timeout or self._thread_timeout
+        timeout = timeout if timeout is not None else self._thread_timeout
         with self._lock:
             alive = [t for t in self._threads if t.is_alive()]
         if not alive:
@@ -245,13 +247,13 @@ class MetalGuard:
         """
         try:
             import mlx.core as mx
-            self.breadcrumb("FLUSH: mx.eval sync")
-            mx.eval(mx.zeros(1))
-            self.breadcrumb("FLUSH: mx.clear_cache()")
-            mx.clear_cache()
-            self.breadcrumb("FLUSH: done")
-        except (ImportError, AttributeError):
-            pass
+        except ImportError:
+            return
+        self.breadcrumb("FLUSH: mx.eval sync")
+        mx.eval(mx.zeros(1))
+        self.breadcrumb("FLUSH: mx.clear_cache()")
+        mx.clear_cache()
+        self.breadcrumb("FLUSH: done")
 
     def safe_cleanup(self) -> None:
         """Full cleanup: wait for threads -> GC -> flush GPU -> cooldown.
@@ -381,6 +383,10 @@ class MetalGuard:
         Accounts for currently active memory + a safety overhead (default 2GB
         for KV cache, OS, and other allocations).
 
+        Note: model_size_gb uses decimal gigabytes (1 GB = 1e9 bytes), which
+        matches mx.get_active_memory() and HuggingFace model card sizes.
+        Binary GiB (1024^3) would overestimate by ~7%.
+
         Usage:
             if not metal_guard.can_fit(model_size_gb=24.0):
                 metal_guard.safe_cleanup()  # Try freeing first
@@ -442,14 +448,14 @@ class MetalGuard:
         """
         try:
             import mlx.core as mx
-            info = mx.device_info()
-            return MemoryStats(
-                active_bytes=mx.get_active_memory(),
-                peak_bytes=mx.get_peak_memory(),
-                limit_bytes=info.get("max_recommended_working_set_size", 0),
-            )
-        except (ImportError, AttributeError):
+        except ImportError:
             return MemoryStats()
+        info = mx.device_info()
+        return MemoryStats(
+            active_bytes=mx.get_active_memory(),
+            peak_bytes=mx.get_peak_memory(),
+            limit_bytes=info.get("max_recommended_working_set_size", 0),
+        )
 
     def is_pressure_high(
         self,
@@ -510,6 +516,7 @@ class MetalGuard:
         """
         self.stop_periodic_flush()
         self._flush_interval = interval_secs
+        self._tick_fn = self._periodic_flush_tick
         self._schedule_next_flush()
         log.info("Periodic Metal flush started (every %.0fs)", interval_secs)
 
@@ -518,15 +525,15 @@ class MetalGuard:
         if self._flush_timer is not None:
             self._flush_timer.cancel()
             self._flush_timer = None
-            self._flush_interval = 0
-            log.info("Periodic Metal flush stopped")
+        self._flush_interval = 0
+        self._tick_fn = self._periodic_flush_tick  # Reset to default
 
     def _schedule_next_flush(self) -> None:
         """Schedule the next periodic flush."""
         if self._flush_interval <= 0:
             return
         self._flush_timer = threading.Timer(
-            self._flush_interval, self._periodic_flush_tick,
+            self._flush_interval, self._tick_fn,
         )
         self._flush_timer.daemon = True
         self._flush_timer.start()
@@ -588,11 +595,12 @@ class MetalGuard:
         self._watchdog_warn_pct = warn_pct
         self._watchdog_critical_pct = critical_pct
         self._watchdog_on_critical = on_critical
-        self._watchdog_baseline: int | None = None
-        # Reuse periodic flush infrastructure
-        self.start_periodic_flush(interval_secs)
-        # Override the tick function
-        self._periodic_flush_tick = self._watchdog_tick  # type: ignore[assignment]
+        self._watchdog_baseline = None
+        # Reuse periodic flush infrastructure with watchdog tick
+        self.stop_periodic_flush()
+        self._flush_interval = interval_secs
+        self._tick_fn = self._watchdog_tick
+        self._schedule_next_flush()
         log.info(
             "Memory watchdog started (every %.0fs, warn=%.0f%%, critical=%.0f%%)",
             interval_secs, warn_pct, critical_pct,
@@ -664,9 +672,11 @@ class MetalGuard:
         """
         if not self._breadcrumb_path:
             return
-        line = f"[{time.strftime('%H:%M:%S')}] {msg}\n"
+        line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
         try:
-            os.makedirs(os.path.dirname(self._breadcrumb_path), exist_ok=True)
+            dirname = os.path.dirname(self._breadcrumb_path)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
             with open(self._breadcrumb_path, "a") as f:
                 f.write(line)
                 f.flush()
