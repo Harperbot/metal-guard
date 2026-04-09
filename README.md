@@ -4,7 +4,7 @@
 
 GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
-Prevents kernel panics caused by the IOGPUFamily Metal driver bug when repeatedly loading and unloading MLX models.
+Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
 ## The Problem
 
@@ -29,10 +29,14 @@ We identified two trigger paths through crash forensics (breadcrumb logs + 9 ker
 
 ### Who Is Affected
 
-- **Single-model servers** (mlx_lm.server, LM Studio): Low risk. One model loaded for the lifetime of the process.
-- **Multi-model pipelines**: **High risk.** Loading model A → unload → load model B → unload → repeat. Each transition is a potential panic trigger.
-
-If your workload loads and unloads 3+ different MLX models per session, you need MetalGuard.
+| Workload | Risk | Why |
+|----------|------|-----|
+| Single-model server (LM Studio) | Low | One model, no switching |
+| Multi-model pipeline | **High** | Load → unload → load → unload, each transition can panic |
+| Long-running server (mlx_lm.server) | **High** | KV cache grows unbounded, Metal buffers accumulate over hours |
+| Agent framework + tool calling | **High** | 50-100 short generate() calls per conversation, fragmented Metal buffers accumulate |
+| TurboQuant KV cache compression | **High** | Pushes memory closer to limits (50K-200K tokens), OOM more likely |
+| 24/7 daemon (OpenClaw-style) | **Critical** | Memory drift over days, no natural cleanup point |
 
 ## Installation
 
@@ -42,7 +46,7 @@ pip install metal-guard
 
 Or copy `metal_guard.py` into your project — it's a single file with no dependencies beyond the Python standard library.
 
-## Usage
+## Quick Start
 
 ```python
 from metal_guard import metal_guard
@@ -69,25 +73,97 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 
 # 4. Breadcrumbs for crash forensics
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
-# ... if kernel panic happens here, breadcrumb log shows last operation
 ```
 
-### Full Model Cache Example
+## v0.2 Features
+
+### OOM Recovery
+
+Catches Metal OOM errors and converts them to recoverable `MetalOOMError` instead of crashing the process. Addresses [mlx-lm#1015](https://github.com/ml-explore/mlx-lm/issues/1015) and [#854](https://github.com/ml-explore/mlx-lm/issues/854).
 
 ```python
-from metal_guard import metal_guard
+from metal_guard import metal_guard, MetalOOMError
+
+# Function wrapper — catches OOM, cleans up, retries once
+result = metal_guard.oom_protected(
+    generate, model, tokenizer, prompt=prompt, max_tokens=4096
+)
+
+# Context manager
+with metal_guard.oom_protected_context():
+    result = generate(model, tokenizer, prompt=prompt)
+
+# For servers — return 503 instead of crashing
+try:
+    result = metal_guard.oom_protected(generate, model, tokenizer, prompt=prompt)
+except MetalOOMError as e:
+    return Response(status_code=503, body=f"GPU memory exhausted: {e.stats}")
+```
+
+### Pre-Load Memory Check
+
+Prevents loading models that won't fit, avoiding the crash entirely. Addresses [mlx-lm#427](https://github.com/ml-explore/mlx-lm/issues/427) and [#1047](https://github.com/ml-explore/mlx-lm/issues/1047).
+
+```python
+# Check before loading
+if not metal_guard.can_fit(model_size_gb=24.0):
+    print("Not enough memory for 24GB model")
+
+# Or let MetalGuard handle it (cleans up first, raises if still won't fit)
+metal_guard.require_fit(24.0, model_name="Mistral-24B-8bit")
+model = load("Mistral-24B-8bit")
+```
+
+### Periodic Flush
+
+Background timer that prevents memory accumulation in long-running processes. Addresses [mlx-lm#854](https://github.com/ml-explore/mlx-lm/issues/854) and [mlx-examples#1124](https://github.com/ml-explore/mlx-examples/issues/1124).
+
+```python
+# Flush GPU cache every 5 minutes (skips if GPU threads are active)
+metal_guard.start_periodic_flush(interval_secs=300)
+
+# Stop when done
+metal_guard.stop_periodic_flush()
+```
+
+### Memory Drift Watchdog
+
+For 24/7 daemons and agent frameworks where memory drifts upward over hours. Escalating response: warn → flush → critical cleanup → app callback.
+
+```python
+def on_critical():
+    """App-level response when memory is critical."""
+    kv_cache.clear()
+    log.error("Memory critical — KV cache dropped")
+
+metal_guard.start_watchdog(
+    interval_secs=60,       # Check every minute
+    warn_pct=70.0,          # Flush at 70%
+    critical_pct=85.0,      # Full cleanup + callback at 85%
+    on_critical=on_critical,
+)
+```
+
+**Why agent frameworks need this:** Each tool call / function call in an agent loop runs a separate `generate()`, accumulating fragmented Metal buffers. A single conversation with 50-100 tool calls can drift memory by several GB without any visible leak. The watchdog catches this drift before it reaches OOM.
+
+## Full Examples
+
+### Model Cache with Safety
+
+```python
+from metal_guard import metal_guard, MetalOOMError
 
 class ModelCache:
     def __init__(self):
         self._models = {}
 
-    def load(self, name):
+    def load(self, name, size_gb=None):
         if name in self._models:
             return self._models[name]
-
-        # Check pressure and clean up if needed
-        metal_guard.ensure_headroom(model_name=name)
-
+        if size_gb:
+            metal_guard.require_fit(size_gb, model_name=name)
+        else:
+            metal_guard.ensure_headroom(model_name=name)
         metal_guard.breadcrumb(f"LOAD: {name} START")
         model = mlx_lm.load(name)
         self._models[name] = model
@@ -95,23 +171,44 @@ class ModelCache:
         return model
 
     def unload_all(self):
-        metal_guard.wait_for_threads()      # Never free while GPU is busy
+        metal_guard.wait_for_threads()
         had_models = bool(self._models)
         self._models.clear()
         if had_models:
-            metal_guard.safe_cleanup()       # gc + flush + cooldown
-        # If cache was empty, skip Metal entirely (prevents panic trigger #2)
+            metal_guard.safe_cleanup()
 
-    def generate(self, name, prompt, **kwargs):
+    def generate_safe(self, name, prompt, **kwargs):
         model, tokenizer = self.load(name)
+        return metal_guard.oom_protected(
+            mlx_lm.generate, model, tokenizer, prompt=prompt, **kwargs
+        )
+```
 
-        def _run():
-            return mlx_lm.generate(model, tokenizer, prompt=prompt, **kwargs)
+### Long-Running Agent Server
 
-        thread = threading.Thread(target=_run, daemon=True)
-        thread.start()
-        metal_guard.register_thread(thread)  # Track GPU thread
-        thread.join(timeout=120)
+```python
+from metal_guard import metal_guard
+
+# Start watchdog for 24/7 operation
+metal_guard.start_watchdog(
+    interval_secs=120,
+    warn_pct=65.0,
+    critical_pct=80.0,
+    on_critical=lambda: server.drop_oldest_session(),
+)
+
+# Each request uses OOM protection
+@app.post("/v1/chat/completions")
+async def chat(request):
+    try:
+        result = metal_guard.oom_protected(
+            generate, model, tokenizer,
+            prompt=request.prompt,
+            max_tokens=request.max_tokens,
+        )
+        return {"choices": [{"message": {"content": result}}]}
+    except MetalOOMError:
+        return JSONResponse(status_code=503, content={"error": "GPU memory exhausted"})
 ```
 
 ### Testing (Prevent Metal in Unit Tests)
@@ -138,15 +235,13 @@ def _block_metal_gpu(request):
 
 ## API Reference
 
-### `MetalGuard(cooldown_secs=2.0, thread_timeout_secs=30.0, breadcrumb_path="logs/metal_breadcrumb.log")`
+### Constructor
 
-Create a MetalGuard instance. A module-level singleton `metal_guard` is provided.
+```python
+MetalGuard(cooldown_secs=2.0, thread_timeout_secs=30.0, breadcrumb_path="logs/metal_breadcrumb.log")
+```
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `cooldown_secs` | 2.0 | Sleep after GPU flush for Metal driver buffer reclamation |
-| `thread_timeout_secs` | 30.0 | Max wait time for GPU threads |
-| `breadcrumb_path` | `"logs/metal_breadcrumb.log"` | Path for crash forensics log. `None` to disable |
+A module-level singleton `metal_guard` is provided.
 
 ### Thread Tracking
 
@@ -163,14 +258,37 @@ Create a MetalGuard instance. A module-level singleton `metal_guard` is provided
 | `safe_cleanup()` | Full sequence: wait → gc.collect → flush → cooldown |
 | `guarded_cleanup()` | Context manager that runs `safe_cleanup()` on exit |
 
+### OOM Recovery (v0.2)
+
+| Method | Description |
+|--------|-------------|
+| `oom_protected(fn, *args, max_retries=1, **kwargs)` | Run function with OOM catch + cleanup + retry |
+| `oom_protected_context()` | Context manager version |
+| `is_metal_oom(exc) -> bool` | Check if exception is Metal OOM |
+
+### Pre-Load Check (v0.2)
+
+| Method | Description |
+|--------|-------------|
+| `can_fit(model_size_gb, overhead_gb=2.0) -> bool` | Check if model fits in available memory |
+| `require_fit(model_size_gb, model_name, overhead_gb=2.0)` | Clean up + raise MemoryError if won't fit |
+
 ### Memory Pressure
 
 | Method | Description |
 |--------|-------------|
-| `memory_stats() -> MemoryStats` | Current GPU memory snapshot |
+| `memory_stats() -> MemoryStats` | Current GPU memory snapshot (active, peak, limit, available) |
 | `is_pressure_high(threshold_pct=67.0) -> bool` | Check if peak memory exceeds threshold |
 | `ensure_headroom(model_name, threshold_pct=67.0)` | Clean up if pressure high, no-op otherwise |
 | `log_memory(label, model_name)` | Log memory state without cleanup |
+
+### Long-Running Process Safety (v0.2)
+
+| Method | Description |
+|--------|-------------|
+| `start_periodic_flush(interval_secs=300)` | Background timer to flush GPU cache |
+| `stop_periodic_flush()` | Stop periodic flush |
+| `start_watchdog(interval_secs, warn_pct, critical_pct, on_critical)` | Memory drift watchdog with escalating response |
 
 ### Forensics
 
@@ -181,30 +299,34 @@ Create a MetalGuard instance. A module-level singleton `metal_guard` is provided
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│           Your Application Code             │
-│                                             │
-│  model = load("model-a")                    │
-│  result = generate(model, prompt)           │
-│  unload_all()  ← DON'T call mx.clear_cache │
-│                   directly, use MetalGuard  │
-└──────────────────┬──────────────────────────┘
+┌─────────────────────────────────────────────────┐
+│            Your Application Code                │
+│                                                 │
+│  Agent loop / Server / Pipeline / Daemon        │
+│  model = load("model-a")                        │
+│  result = metal_guard.oom_protected(generate, …) │
+│  unload_all()                                   │
+└──────────────────┬──────────────────────────────┘
                    │
-┌──────────────────▼──────────────────────────┐
-│             MetalGuard                      │
-│                                             │
-│  Thread Registry ─── wait before cleanup    │
-│  Safe Cleanup ────── gc + flush + cooldown  │
-│  Pressure Monitor ── headroom before load   │
-│  Breadcrumb Log ──── crash forensics        │
-└──────────────────┬──────────────────────────┘
+┌──────────────────▼──────────────────────────────┐
+│              MetalGuard                         │
+│                                                 │
+│  Thread Registry ──── wait before cleanup       │
+│  Safe Cleanup ─────── gc + flush + cooldown     │
+│  OOM Recovery ─────── catch + cleanup + retry   │
+│  Pre-Load Check ───── can_fit / require_fit     │
+│  Pressure Monitor ─── headroom before load      │
+│  Periodic Flush ───── background cache clear    │
+│  Memory Watchdog ──── drift detection + alerts  │
+│  Breadcrumb Log ───── crash forensics           │
+└──────────────────┬──────────────────────────────┘
                    │
-┌──────────────────▼──────────────────────────┐
-│          MLX + Metal Driver                 │
-│                                             │
-│  mx.eval()  mx.clear_cache()  mx.zeros()   │
-│  ⚠️  Driver bug: panics instead of OOM     │
-└─────────────────────────────────────────────┘
+┌──────────────────▼──────────────────────────────┐
+│           MLX + Metal Driver                    │
+│                                                 │
+│  mx.eval()  mx.clear_cache()  mx.zeros()       │
+│  ⚠️  Driver bug: panics instead of OOM         │
+└─────────────────────────────────────────────────┘
 ```
 
 ## Tested On
@@ -215,10 +337,17 @@ Create a MetalGuard instance. A module-level singleton `metal_guard` is provided
 
 ## Related Issues
 
-- [ml-explore/mlx-lm#883](https://github.com/ml-explore/mlx-lm/issues/883) — Kernel panic from unbounded KV cache
-- [ml-explore/mlx#2133](https://github.com/ml-explore/mlx/issues/2133) — Thread safety ongoing
-- [ml-explore/mlx#3126](https://github.com/ml-explore/mlx/issues/3126) — Sub-thread exit crash
-- [ml-explore/mlx#3078](https://github.com/ml-explore/mlx/issues/3078) — Concurrent inference unsupported
+Issues that MetalGuard addresses:
+
+| Issue | Problem | MetalGuard Feature |
+|-------|---------|-------------------|
+| [mlx-lm#883](https://github.com/ml-explore/mlx-lm/issues/883) | Kernel panic from KV cache growth | Thread tracking + safe cleanup |
+| [mlx-lm#1015](https://github.com/ml-explore/mlx-lm/issues/1015) | generate() OOM crashes process | `oom_protected()` |
+| [mlx-lm#854](https://github.com/ml-explore/mlx-lm/issues/854) | Server OOM crash, no HTTP error | `oom_protected()` + `periodic_flush` |
+| [mlx-lm#427](https://github.com/ml-explore/mlx-lm/issues/427) | M1 MBA crash on model load | `can_fit()` / `require_fit()` |
+| [mlx-lm#1047](https://github.com/ml-explore/mlx-lm/issues/1047) | KV cache OOM on large model | `can_fit()` + `ensure_headroom()` |
+| [mlx-examples#1124](https://github.com/ml-explore/mlx-examples/issues/1124) | Server memory leak → reboot | `periodic_flush` + `watchdog` |
+| [mlx#2133](https://github.com/ml-explore/mlx/issues/2133) | Thread safety ongoing | `register_thread()` + `wait_for_threads()` |
 
 ## License
 

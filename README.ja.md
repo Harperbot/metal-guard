@@ -4,35 +4,29 @@
 
 Apple Silicon 上の [MLX](https://github.com/ml-explore/mlx) 向け GPU 安全レイヤー。
 
-MLX モデルの繰り返しロード・アンロード時に Metal ドライバーのバグが引き起こすカーネルパニックを防止します。
+Metal ドライバーのバグによるカーネルパニックや OOM クラッシュを防止します。特にマルチモデルパイプライン、長時間稼働サーバー、ツールコールが多いエージェントフレームワーク向け。
 
 ## 問題の概要
 
-Apple Silicon の Metal GPU ドライバーにはバグがあり、**GPU メモリ管理に失敗した場合、プロセスを正常に終了させるのではなく、マシン全体がカーネルパニックで再起動します。**
+Apple Silicon の Metal GPU ドライバーにはバグがあり、**GPU メモリ管理に失敗した場合、プロセスを正常終了させるのではなく、マシン全体がカーネルパニックで再起動します。**
 
 ```
 panic(cpu 4 caller 0xfffffe0032a550f8):
   "completeMemory() prepare count underflow" @IOGPUMemory.cpp:492
 ```
 
-複数の MLX モデルを順次ロード・アンロードするワークフローすべてに影響します。Metal ドライバーの内部参照カウントがアンダーフローし、回復不能なカーネルパニックを引き起こす可能性があります。
-
 **これはあなたのコードのバグではありません。** ドライバーレベルのバグであり、修正時期は未定です。参照：[ml-explore/mlx-lm#883](https://github.com/ml-explore/mlx-lm/issues/883)
-
-### 根本原因
-
-クラッシュフォレンジック（breadcrumb ログ + M1 Ultra での 9 回のカーネルパニック）を通じて、2 つのトリガーパスを特定しました：
-
-1. **デーモンスレッドの競合状態** — `mlx_lm.generate()` がデーモンスレッドで実行され、GPU バッファを保持。スレッド終了前に `mx.clear_cache()` が呼ばれると、Metal は使用中のバッファを解放しようとし → 参照カウントアンダーフロー → カーネルパニック。
-
-2. **無条件の Metal 初期化** — モデルが未ロードでも `mx.eval()` や `mx.clear_cache()` を呼ぶと Metal ドライバーが初期化される。以前のクラッシュでドライバーが不安定な状態にある場合、これだけでパニックが発生する可能性がある。
 
 ### 影響を受ける対象
 
-- **シングルモデルサーバー**（mlx_lm.server、LM Studio）：低リスク。プロセスの全期間で 1 つのモデルのみ。
-- **マルチモデルパイプライン**：**高リスク。** モデル A ロード → アンロード → モデル B ロード → アンロード → 繰り返し。切り替えのたびにパニックの可能性。
-
-セッションごとに 3 つ以上の異なる MLX モデルをロード・アンロードする場合、MetalGuard が必要です。
+| ワークロード | リスク | 理由 |
+|-------------|--------|------|
+| シングルモデルサーバー（LM Studio） | 低 | モデル切り替えなし |
+| マルチモデルパイプライン | **高** | ロード→アンロード→ロード、切り替えごとにパニックの可能性 |
+| 長時間稼働サーバー（mlx_lm.server） | **高** | KV キャッシュ無制限成長、Metal バッファ蓄積 |
+| エージェントフレームワーク + ツールコール | **高** | 会話ごとに50-100回の短い推論、断片化した Metal バッファの蓄積 |
+| TurboQuant KV キャッシュ圧縮 | **高** | メモリ上限に近づく（50K-200Kトークン）、OOM 発生しやすい |
+| 24時間365日デーモン（OpenClaw型） | **極高** | 日数とともにメモリドリフト、自然なクリーンアップポイントなし |
 
 ## インストール
 
@@ -40,140 +34,208 @@ panic(cpu 4 caller 0xfffffe0032a550f8):
 pip install metal-guard
 ```
 
-または `metal_guard.py` をプロジェクトにコピーしてください。Python 標準ライブラリ以外の依存関係はありません。
+または `metal_guard.py` をプロジェクトにコピー。単一ファイル、依存関係なし。
 
-## 使い方
+## クイックスタート
 
 ```python
 from metal_guard import metal_guard
 
-# 1. GPU スレッドの追跡
-import threading
-
+# 1. GPU スレッド追跡
 thread = threading.Thread(target=run_mlx_generate, daemon=True)
 thread.start()
-metal_guard.register_thread(thread)  # 追跡する
-thread.join(timeout=120)
+metal_guard.register_thread(thread)
 
 # 2. 安全なモデルアンロード
-def unload_model(cache):
-    metal_guard.wait_for_threads()  # GPU の処理完了を待つ
-    had_models = bool(cache)
-    cache.clear()
-    if had_models:
-        metal_guard.safe_cleanup()  # gc + GPU フラッシュ + クールダウン
+metal_guard.wait_for_threads()
+cache.clear()
+metal_guard.safe_cleanup()
 
-# 3. ロード前のメモリ圧力チェック
+# 3. ロード前のメモリチェック
 metal_guard.ensure_headroom(model_name="my-model-8bit")
-model, tokenizer = mlx_lm.load("my-model-8bit")
-
-# 4. クラッシュフォレンジック用 breadcrumb
-metal_guard.breadcrumb("LOAD: my-model-8bit START")
-# ...ここでカーネルパニックが発生した場合、breadcrumb ログに最後の操作が記録される
 ```
 
-### 完全な ModelCache の例
+## v0.2 新機能
+
+### OOM リカバリー
+
+Metal OOM エラーをキャッチし、回復可能な `MetalOOMError` に変換。プロセスをクラッシュさせません。
 
 ```python
-from metal_guard import metal_guard
+from metal_guard import metal_guard, MetalOOMError
+
+# OOM キャッチ → クリーンアップ → リトライ
+result = metal_guard.oom_protected(generate, model, tokenizer, prompt=prompt)
+
+# サーバー向け — クラッシュではなく503を返す
+try:
+    result = metal_guard.oom_protected(generate, model, tokenizer, prompt=prompt)
+except MetalOOMError as e:
+    return Response(status_code=503, body=f"GPU メモリ不足: {e.stats}")
+```
+
+### ロード前メモリチェック
+
+収まらないモデルのロードを防止。
+
+```python
+if not metal_guard.can_fit(model_size_gb=24.0):
+    print("24GBモデルに十分なメモリがありません")
+
+metal_guard.require_fit(24.0, model_name="Mistral-24B-8bit")
+```
+
+### 定期フラッシュ
+
+長時間プロセスのバックグラウンド定期クリーンアップ。
+
+```python
+metal_guard.start_periodic_flush(interval_secs=300)  # 5分ごと
+```
+
+### メモリドリフトウォッチドッグ
+
+24時間稼働デーモンとエージェントフレームワーク向け。段階的対応：警告 → フラッシュ → 危険時クリーンアップ → コールバック。
+
+```python
+def on_critical():
+    kv_cache.clear()
+    log.error("メモリ危険 — KV キャッシュをクリア")
+
+metal_guard.start_watchdog(
+    interval_secs=60,       # 毎分チェック
+    warn_pct=70.0,          # 70%でフラッシュ
+    critical_pct=85.0,      # 85%で完全クリーンアップ + コールバック
+    on_critical=on_critical,
+)
+```
+
+**エージェントフレームワークにこれが必要な理由：** ツールコール / ファンクションコールのたびに `generate()` が実行され、断片化した Metal バッファが蓄積します。50-100回のツールコールで数GBのメモリドリフトが発生しますが、明らかなリークはありません。ウォッチドッグはOOMに達する前にこのドリフトを検出します。
+
+## 完全な例
+
+### 安全機能付き ModelCache
+
+```python
+from metal_guard import metal_guard, MetalOOMError
 
 class ModelCache:
     def __init__(self):
         self._models = {}
 
-    def load(self, name):
+    def load(self, name, size_gb=None):
         if name in self._models:
             return self._models[name]
-        metal_guard.ensure_headroom(model_name=name)
-        metal_guard.breadcrumb(f"LOAD: {name} START")
+        if size_gb:
+            metal_guard.require_fit(size_gb, model_name=name)
+        else:
+            metal_guard.ensure_headroom(model_name=name)
         model = mlx_lm.load(name)
         self._models[name] = model
-        metal_guard.breadcrumb(f"LOAD: {name} DONE")
         return model
 
     def unload_all(self):
-        metal_guard.wait_for_threads()      # GPU 使用中は解放しない
+        metal_guard.wait_for_threads()
         had_models = bool(self._models)
         self._models.clear()
         if had_models:
-            metal_guard.safe_cleanup()       # gc + flush + cooldown
-        # キャッシュが空なら Metal を完全にスキップ（トリガーパス #2 を防止）
+            metal_guard.safe_cleanup()
+
+    def generate_safe(self, name, prompt, **kwargs):
+        model, tokenizer = self.load(name)
+        return metal_guard.oom_protected(
+            mlx_lm.generate, model, tokenizer, prompt=prompt, **kwargs
+        )
 ```
 
-### テスト（ユニットテストで Metal を防止）
+### 長時間稼働エージェントサーバー
 
 ```python
-# conftest.py
-from unittest.mock import MagicMock, patch
-import pytest
+metal_guard.start_watchdog(
+    interval_secs=120,
+    warn_pct=65.0,
+    critical_pct=80.0,
+    on_critical=lambda: server.drop_oldest_session(),
+)
 
-@pytest.fixture(autouse=True)
-def _block_metal_gpu(request):
-    """ユニットテストでの Metal GPU 初期化を防止。"""
-    if "integration" in [m.name for m in request.node.iter_markers()]:
-        yield
-        return
-    mock_mx = MagicMock()
-    mock_mx.device_info.return_value = {"max_recommended_working_set_size": 48e9}
-    mock_mx.get_active_memory.return_value = 0
-    mock_mx.get_peak_memory.return_value = 0
-    mock_mx.zeros.return_value = mock_mx
-    with patch.dict("sys.modules", {"mlx.core": mock_mx}):
-        yield
+@app.post("/v1/chat/completions")
+async def chat(request):
+    try:
+        result = metal_guard.oom_protected(generate, model, tokenizer, prompt=request.prompt)
+        return {"choices": [{"message": {"content": result}}]}
+    except MetalOOMError:
+        return JSONResponse(status_code=503, content={"error": "GPU メモリ不足"})
 ```
 
 ## API リファレンス
-
-### `MetalGuard(cooldown_secs=2.0, thread_timeout_secs=30.0, breadcrumb_path="logs/metal_breadcrumb.log")`
-
-| パラメータ | デフォルト | 説明 |
-|-----------|----------|------|
-| `cooldown_secs` | 2.0 | GPU フラッシュ後の待機時間（Metal ドライバーのバッファ回収用） |
-| `thread_timeout_secs` | 30.0 | GPU スレッドの最大待機時間 |
-| `breadcrumb_path` | `"logs/metal_breadcrumb.log"` | クラッシュフォレンジックのログパス。`None` で無効化 |
 
 ### スレッド追跡
 
 | メソッド | 説明 |
 |---------|------|
-| `register_thread(thread)` | GPU バッファを保持するスレッドを追跡 |
-| `wait_for_threads(timeout) -> int` | GPU スレッド完了まで待機。まだ生存中の数を返す |
+| `register_thread(thread)` | GPU バッファ保持スレッドを追跡 |
+| `wait_for_threads(timeout) -> int` | GPU スレッド完了まで待機 |
 
 ### GPU クリーンアップ
 
 | メソッド | 説明 |
 |---------|------|
-| `flush_gpu()` | `mx.eval(sync)` + `mx.clear_cache()`。`wait_for_threads()` の後にのみ使用 |
-| `safe_cleanup()` | 完全シーケンス：wait → gc.collect → flush → cooldown |
-| `guarded_cleanup()` | コンテキストマネージャ。終了時に `safe_cleanup()` を実行 |
+| `flush_gpu()` | `mx.eval(sync)` + `mx.clear_cache()` |
+| `safe_cleanup()` | 完全シーケンス：wait → gc → flush → cooldown |
+| `guarded_cleanup()` | コンテキストマネージャ |
+
+### OOM リカバリー (v0.2)
+
+| メソッド | 説明 |
+|---------|------|
+| `oom_protected(fn, *args, max_retries=1)` | OOM キャッチ → クリーンアップ → リトライ |
+| `oom_protected_context()` | コンテキストマネージャ版 |
+| `is_metal_oom(exc) -> bool` | Metal OOM かどうか判定 |
+
+### ロード前チェック (v0.2)
+
+| メソッド | 説明 |
+|---------|------|
+| `can_fit(model_size_gb, overhead_gb=2.0) -> bool` | 利用可能なメモリにモデルが収まるか |
+| `require_fit(model_size_gb, model_name)` | 収まらなければクリーンアップ、それでもダメならエラー |
 
 ### メモリ圧力
 
 | メソッド | 説明 |
 |---------|------|
 | `memory_stats() -> MemoryStats` | 現在の GPU メモリスナップショット |
-| `is_pressure_high(threshold_pct) -> bool` | ピークメモリが閾値を超えているか |
-| `ensure_headroom(model_name, threshold_pct)` | 圧力が高ければクリーンアップ、そうでなければ何もしない |
-| `log_memory(label, model_name)` | メモリ状態をログ出力（クリーンアップなし） |
+| `is_pressure_high(threshold_pct) -> bool` | ピークが閾値を超えているか |
+| `ensure_headroom(model_name, threshold_pct)` | 圧力が高ければクリーンアップ |
+
+### 長時間稼働安全 (v0.2)
+
+| メソッド | 説明 |
+|---------|------|
+| `start_periodic_flush(interval_secs=300)` | バックグラウンド定期フラッシュ |
+| `start_watchdog(interval, warn_pct, critical_pct, on_critical)` | メモリドリフトウォッチドッグ |
 
 ### フォレンジック
 
 | メソッド | 説明 |
 |---------|------|
-| `breadcrumb(msg)` | fsync された breadcrumb ログに書き込み |
+| `breadcrumb(msg)` | fsync されたクラッシュフォレンジックログ |
+
+## 対応するコミュニティの問題
+
+| Issue | 問題 | MetalGuard 機能 |
+|-------|------|----------------|
+| [mlx-lm#883](https://github.com/ml-explore/mlx-lm/issues/883) | KV キャッシュ成長 → カーネルパニック | スレッド追跡 + 安全クリーンアップ |
+| [mlx-lm#1015](https://github.com/ml-explore/mlx-lm/issues/1015) | generate() OOM でプロセス終了 | `oom_protected()` |
+| [mlx-lm#854](https://github.com/ml-explore/mlx-lm/issues/854) | サーバー OOM、HTTP エラーなし | `oom_protected()` + `periodic_flush` |
+| [mlx-lm#427](https://github.com/ml-explore/mlx-lm/issues/427) | M1 MBA でモデルロード時クラッシュ | `can_fit()` / `require_fit()` |
+| [mlx-lm#1047](https://github.com/ml-explore/mlx-lm/issues/1047) | 大型モデル KV キャッシュ OOM | `can_fit()` + `ensure_headroom()` |
+| [mlx-examples#1124](https://github.com/ml-explore/mlx-examples/issues/1124) | サーバーメモリリーク → 再起動 | `periodic_flush` + `watchdog` |
 
 ## テスト実績
 
-- Mac Studio M1 Ultra (64GB) — MetalGuard 導入前 9 回のカーネルパニック、導入後 0 回
-- 10 ユーザーバッチパイプライン：約 90 回のモデルロード/アンロード、994 秒、クラッシュゼロ
-- テストモデル：Mistral-Small-3.2-24B、Phi-4-mini、Gemma-4-26B/31B、Pixtral-12B、LFM2-VL-3B（8-bit / 4-bit）
-
-## 関連 Issue
-
-- [ml-explore/mlx-lm#883](https://github.com/ml-explore/mlx-lm/issues/883) — KV キャッシュ無制限成長によるカーネルパニック
-- [ml-explore/mlx#2133](https://github.com/ml-explore/mlx/issues/2133) — スレッドセーフティの継続的問題
-- [ml-explore/mlx#3126](https://github.com/ml-explore/mlx/issues/3126) — サブスレッドの終了時クラッシュ
-- [ml-explore/mlx#3078](https://github.com/ml-explore/mlx/issues/3078) — concurrent inference 未サポート
+- Mac Studio M1 Ultra (64GB) — MetalGuard 前 9回カーネルパニック、導入後 0回
+- 10ユーザーバッチ：約90回モデルロード/アンロード、994秒、クラッシュゼロ
+- テストモデル：Mistral-Small-3.2-24B、Phi-4-mini、Gemma-4-26B/31B、Pixtral-12B、LFM2-VL-3B
 
 ## ライセンス
 
