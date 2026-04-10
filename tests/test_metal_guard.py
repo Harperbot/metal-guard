@@ -259,6 +259,74 @@ class TestCanFit:
         with pytest.raises(MemoryError, match="Cannot fit"):
             guard.require_fit(24.0, model_name="huge-model")
 
+    def test_require_fit_escalated_retry_calls_cache_clear(self, guard, _mock_mlx):
+        """Escalated retry must invoke cache_clear_cb + sleep + re-check.
+
+        Added in 0.2.3 — fixes the 2026-04-10 kantocamera OOM where standard
+        safe_cleanup left 26.8GB active blocking a 24GB mistral load.
+        """
+        state = {"cleared": False}
+
+        def dynamic_active():
+            # Before cache_clear_cb runs: memory still full.
+            # After cb runs: memory freed (simulates escalated recovery).
+            return 5_000_000_000 if state["cleared"] else 40_000_000_000
+
+        _mock_mlx.get_active_memory.side_effect = dynamic_active
+
+        def clear_cb():
+            state["cleared"] = True
+
+        guard.require_fit(
+            24.0,
+            model_name="test",
+            cache_clear_cb=clear_cb,
+            escalated_cooldown_sec=0.01,  # tiny for fast test
+        )
+        assert state["cleared"], "cache_clear_cb should have been invoked during escalation"
+
+    def test_require_fit_escalated_propagates_cb_exception_non_fatally(self, guard, _mock_mlx):
+        """A failing cache_clear_cb must not abort escalation — logged, continues."""
+        state = {"cb_attempted": False}
+
+        def dynamic_active():
+            # Memory still full until cb "would have" cleared it — but cb raises,
+            # so escalation keeps going with its own safe_cleanup and reset.
+            # Simulate: the second safe_cleanup + cooldown does free the memory.
+            return 5_000_000_000 if state["cb_attempted"] else 40_000_000_000
+
+        _mock_mlx.get_active_memory.side_effect = dynamic_active
+
+        def bad_cb():
+            state["cb_attempted"] = True
+            raise RuntimeError("cache clear exploded")
+
+        # Must not propagate the cb exception — escalation path keeps going
+        # and eventually the second can_fit returns True.
+        guard.require_fit(
+            24.0,
+            model_name="test",
+            cache_clear_cb=bad_cb,
+            escalated_cooldown_sec=0.01,
+        )
+        assert state["cb_attempted"], "bad cb should have been invoked before raising"
+
+    def test_require_fit_escalated_still_raises_if_hopeless(self, guard, _mock_mlx):
+        """If escalation can't free enough memory, raise MemoryError with escalated cooldown in message."""
+        _mock_mlx.get_active_memory.return_value = 45_000_000_000  # always full
+        with pytest.raises(MemoryError, match="escalated cleanup"):
+            guard.require_fit(
+                24.0,
+                model_name="huge-model",
+                cache_clear_cb=lambda: None,
+                escalated_cooldown_sec=0.01,
+            )
+
+    def test_require_fit_backward_compat_no_escalated_param(self, guard, _mock_mlx):
+        """Calling require_fit without new params still works (backward compat)."""
+        _mock_mlx.get_active_memory.return_value = 0
+        guard.require_fit(24.0, model_name="test")  # old-style call, no kwargs
+
 
 # ── Model size estimator ─────────────────────────────────────────────────
 

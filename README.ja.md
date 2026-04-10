@@ -55,7 +55,54 @@ metal_guard.safe_cleanup()
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
 
-## v0.2.2 新機能
+## v0.2.3 新機能
+
+### `require_fit` エスカレーションリトライ (v0.2.3)
+
+メモリ逼迫したアンサンブルワークロード向けの 2 段階リトライ戦略。
+標準の `safe_cleanup` 後にも残留 GPU バッファが残り、次の大きなモデル
+が入らない OOM パスを修正します。特に M1 Ultra でマルチディベーター
+アンサンブルを動かす場合、KOL ごとに mistral-24B → phi-4-mini →
+gemma-4-26B の完全サイクルを通過し、次のバッチで Metal が OS にページ
+を返還する前に mistral-24B を再ロードしようとすると頻発します。
+
+```python
+from metal_guard import metal_guard
+
+# 標準呼び出し（後方互換 — エスカレーションなし）:
+metal_guard.require_fit(24.0, model_name="Mistral-24B-8bit")
+
+# エスカレーションリトライ：Python 側参照を破棄 → 再クリーンアップ →
+# 追加クールダウン → 再チェック。escalated_cooldown_sec > 0 でオプトイン:
+metal_guard.require_fit(
+    24.0,
+    model_name="Mistral-24B-8bit",
+    cache_clear_cb=my_model_cache.clear,
+    escalated_cooldown_sec=5.0,
+)
+```
+
+**2 段階の動作：**
+
+| 段階 | アクション | 発動条件 |
+|---|---|---|
+| 1. 標準 | `safe_cleanup()`（スレッド待機 + gc + flush + 内部クールダウン） | `can_fit` 初回チェック失敗時 |
+| 2. エスカレーション | `cache_clear_cb()` → `safe_cleanup()` → `mlx.reset_peak_memory()` → `sleep(escalated_cooldown_sec)` → 再チェック | 段階 1 で不足 **かつ** 呼び出し側がオプトイン |
+
+エスカレーションは**オプトイン**です。MetalGuard は呼び出し側のモデル
+キャッシュ実装を知らないため、`cache_clear_cb`（通常は
+`your_cache_dict.clear`）と Metal が実際にページを OS に返すのに十分な
+クールダウン時間を渡す必要があります。M1 Ultra で 24GB モデルの場合、
+経験的に 5 秒で十分です。
+
+`cache_clear_cb` 内の例外は**ログに記録されますが致命的ではありません** —
+エスカレーションパスは自身の `safe_cleanup` で続行するため、不良な
+cache-clear コールバックがリカバリーパスを汚染することはありません。
+
+エスカレーション後も収まらない場合、`MemoryError` がスローされ、
+メッセージに `escalated cleanup` という文字列が含まれます（本番ログでの
+grep 用）。同時にロード済みモデル数の削減またはより小さい量子化への
+切り替えを提案します。
 
 ### モデルサイズ推定器 (v0.2.2)
 

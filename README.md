@@ -75,7 +75,54 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
 ```
 
-## v0.2.2 Features
+## v0.2.3 Features
+
+### Escalated Retry in `require_fit` (v0.2.3)
+
+A two-tier retry strategy for tight-memory ensemble workloads. Fixes the
+observed OOM path where the standard `safe_cleanup` leaves enough stale
+GPU buffers that a large follow-up model still can't fit — particularly
+common on M1 Ultra running multi-debater ensembles where each KOL sees
+the full cycle mistral-24B → phi-4-mini → gemma-4-26B and the next batch
+tries to load mistral-24B again before Metal has returned pages to the OS.
+
+```python
+from metal_guard import metal_guard
+
+# Standard call (backward compatible — no escalation):
+metal_guard.require_fit(24.0, model_name="Mistral-24B-8bit")
+
+# Escalated retry: drop Python-side references, second cleanup,
+# extra cooldown, re-check. Opt-in via escalated_cooldown_sec > 0:
+metal_guard.require_fit(
+    24.0,
+    model_name="Mistral-24B-8bit",
+    cache_clear_cb=my_model_cache.clear,
+    escalated_cooldown_sec=5.0,
+)
+```
+
+**How the two tiers work:**
+
+| Tier | Action | When |
+|---|---|---|
+| 1. Standard | `safe_cleanup()` (wait threads + gc + flush + internal cooldown) | `can_fit` fails on first check |
+| 2. Escalated | `cache_clear_cb()` → `safe_cleanup()` → `mlx.reset_peak_memory()` → `sleep(escalated_cooldown_sec)` → re-check | Tier 1 still insufficient AND caller opted in |
+
+The escalation is **opt-in** because MetalGuard has no knowledge of the
+caller's model-cache implementation. You pass in a `cache_clear_cb`
+(typically `your_cache_dict.clear`) and a cooldown long enough for Metal
+to actually return pages to the OS. 5 seconds is empirically sufficient
+for a 24GB model on M1 Ultra.
+
+Errors in `cache_clear_cb` are logged but non-fatal — escalation
+continues with its own `safe_cleanup` so a bad cache-clear callback
+can't poison the recovery path.
+
+If escalation still can't free enough memory, `MemoryError` is raised
+with the word `escalated cleanup` in the message (useful for grep in
+production logs) and suggests reducing max loaded models or switching
+to a smaller quant.
 
 ### Model Size Estimator (v0.2.2)
 

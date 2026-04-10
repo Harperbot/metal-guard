@@ -55,7 +55,50 @@ metal_guard.safe_cleanup()
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
 
-## v0.2.2 新功能
+## v0.2.3 新功能
+
+### `require_fit` 升級重試機制 (v0.2.3)
+
+針對記憶體吃緊的 ensemble 工作負載加入二層重試策略。解決已觀察到的
+OOM 路徑：標準 `safe_cleanup` 結束後還留有足夠的殘存 GPU buffer，
+導致下一個大模型仍然塞不下 — 特別常見於 M1 Ultra 跑多辯手 ensemble，
+每個 KOL 都要經歷 mistral-24B → phi-4-mini → gemma-4-26B 的完整輪轉，
+而下一批的 mistral-24B 在 Metal 還沒把 pages 還給 OS 之前就要載入。
+
+```python
+from metal_guard import metal_guard
+
+# 標準呼叫（向後相容 — 不觸發 escalation）:
+metal_guard.require_fit(24.0, model_name="Mistral-24B-8bit")
+
+# 升級重試：丟棄 Python 端 cache 參考、再清理一次、額外冷卻、重新檢查
+# opt-in 方式是傳 escalated_cooldown_sec > 0:
+metal_guard.require_fit(
+    24.0,
+    model_name="Mistral-24B-8bit",
+    cache_clear_cb=my_model_cache.clear,
+    escalated_cooldown_sec=5.0,
+)
+```
+
+**兩層的運作方式：**
+
+| 層級 | 動作 | 觸發條件 |
+|---|---|---|
+| 1. 標準 | `safe_cleanup()`（等 thread + gc + flush + 內部冷卻） | `can_fit` 第一次檢查失敗 |
+| 2. 升級 | `cache_clear_cb()` → `safe_cleanup()` → `mlx.reset_peak_memory()` → `sleep(escalated_cooldown_sec)` → 再檢查 | 第 1 層仍然不夠 **且** 呼叫方有 opt-in |
+
+升級路徑**預設關閉**，因為 MetalGuard 不知道呼叫方的 model cache 是
+怎麼實作的。你傳進一個 `cache_clear_cb`（通常是 `your_cache_dict.clear`）
+以及一個夠長的冷卻時間，讓 Metal 真的把 pages 還給 OS。5 秒在 M1 Ultra
+上跑 24GB 模型經驗上足夠。
+
+`cache_clear_cb` 裡面的例外**會記錄但不致命** — 升級路徑會繼續走自己的
+`safe_cleanup`，所以壞掉的 cache-clear callback 不會毒化整個恢復路徑。
+
+如果升級後還是放不下，會丟出 `MemoryError` 並在訊息裡包含
+`escalated cleanup` 字樣（production log grep 用），同時建議減少同時
+載入的模型數或切換到更小的量化版本。
 
 ### 模型大小估算器 (v0.2.2)
 

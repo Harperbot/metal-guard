@@ -428,14 +428,45 @@ class MetalGuard:
         model_size_gb: float,
         model_name: str = "",
         overhead_gb: float = 2.0,
+        *,
+        cache_clear_cb: Callable[[], None] | None = None,
+        escalated_cooldown_sec: float = 0.0,
     ) -> None:
         """Ensure a model can fit, cleaning up first if needed.
 
-        Raises MemoryError if it still doesn't fit after cleanup.
+        Two-tier retry strategy:
 
-        Usage:
+        1. **Standard** — if ``can_fit`` fails, run ``safe_cleanup`` once and
+           re-check. This handles transient GPU buffer pressure where a
+           ``wait_for_threads + gc + flush + internal cooldown`` is enough.
+
+        2. **Escalated** (opt-in via ``escalated_cooldown_sec > 0``) — if the
+           standard retry still can't fit, invoke the caller-supplied
+           ``cache_clear_cb`` to drop Python-side references (their model
+           dict), run a second ``safe_cleanup``, reset ``mlx.core.reset_peak_memory``,
+           sleep ``escalated_cooldown_sec`` to let Metal's internal pool
+           actually return pages to the OS, then re-check a final time.
+
+        Escalation is **opt-in** because the cache clear callback is
+        application-specific (MetalGuard has no global knowledge of your
+        ModelCache implementation). Pass ``escalated_cooldown_sec=5.0`` and
+        ``cache_clear_cb=my_cache.clear`` to enable.
+
+        Raises ``MemoryError`` if the model still doesn't fit after the
+        highest-level retry that was enabled.
+
+        Usage::
+
+            # Standard (no escalation):
             metal_guard.require_fit(24.0, model_name="Mistral-24B-8bit")
-            model = load("Mistral-24B-8bit")
+
+            # Escalated retry for tight-memory ensembles:
+            metal_guard.require_fit(
+                24.0,
+                model_name="Mistral-24B-8bit",
+                cache_clear_cb=my_model_cache.clear,
+                escalated_cooldown_sec=5.0,
+            )
         """
         if self.can_fit(model_size_gb, overhead_gb):
             return
@@ -443,13 +474,57 @@ class MetalGuard:
         log.info("Cleaning up to make room for %s (%.1fGB)...", model_name, model_size_gb)
         self.safe_cleanup()
 
-        if not self.can_fit(model_size_gb, overhead_gb):
+        if self.can_fit(model_size_gb, overhead_gb):
+            return
+
+        # Standard cleanup insufficient. Raise now unless caller opted into
+        # escalated retry.
+        if escalated_cooldown_sec <= 0:
             stats = self.memory_stats()
             raise MemoryError(
                 f"Cannot fit {model_name or 'model'} ({model_size_gb:.1f}GB) "
                 f"even after cleanup. Available: {stats.available_gb:.1f}GB, "
                 f"needed: {model_size_gb + overhead_gb:.1f}GB"
             )
+
+        # Escalated retry: drop caller's cache references, second cleanup,
+        # longer sleep to force Metal page release, re-check.
+        log.warning(
+            "Standard cleanup insufficient for %s — escalating "
+            "(cache_clear_cb=%s, cooldown=%.1fs)",
+            model_name or "model",
+            "yes" if cache_clear_cb else "no",
+            escalated_cooldown_sec,
+        )
+        if cache_clear_cb is not None:
+            try:
+                cache_clear_cb()
+            except Exception as exc:  # noqa: BLE001 — caller failure must not abort escalation
+                log.warning("cache_clear_cb raised: %s (continuing escalation)", exc)
+        self.safe_cleanup()
+        try:
+            import mlx.core as mx
+            mx.reset_peak_memory()
+        except (ImportError, AttributeError):
+            pass
+        time.sleep(escalated_cooldown_sec)
+
+        if self.can_fit(model_size_gb, overhead_gb):
+            log.info(
+                "Escalated cleanup succeeded — %s (%.1fGB) now fits",
+                model_name or "model", model_size_gb,
+            )
+            return
+
+        stats = self.memory_stats()
+        raise MemoryError(
+            f"Cannot fit {model_name or 'model'} ({model_size_gb:.1f}GB) "
+            f"even after escalated cleanup ({escalated_cooldown_sec}s cooldown). "
+            f"active={stats.active_gb:.1f}GB "
+            f"available={stats.available_gb:.1f}GB "
+            f"needed={model_size_gb + overhead_gb:.1f}GB. "
+            f"Consider reducing max loaded models or switching to a smaller quant."
+        )
 
     @staticmethod
     def estimate_model_size_from_name(model_name: str) -> float | None:
