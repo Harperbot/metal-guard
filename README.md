@@ -75,6 +75,80 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
 ```
 
+## v0.2.2 Features
+
+### Model Size Estimator (v0.2.2)
+
+Parse a model's Metal footprint directly from its name. Designed to feed
+into `require_fit` so multi-model ensemble workloads can proactively evict
+cached models before hitting the Metal working-set limit.
+
+```python
+from metal_guard import MetalGuard, metal_guard
+
+# Static method — no instance required
+size = MetalGuard.estimate_model_size_from_name(
+    "mlx-community/Mistral-Small-24B-8bit"
+)
+# → 24.0 GB  (24B params × 1.0 bytes/param for 8-bit)
+
+size = MetalGuard.estimate_model_size_from_name(
+    "mlx-community/Phi-4-mini-instruct-4bit"
+)
+# → 2.0 GB  (mini-class fallback: 4B × 0.5 for 4-bit)
+
+# Pair with require_fit as a pre-load gate
+name = "mlx-community/gemma-4-31b-8bit"
+size = MetalGuard.estimate_model_size_from_name(name)
+if size is not None:
+    metal_guard.require_fit(size, model_name=name)
+model = load(name)  # refused before load if Metal can't fit
+```
+
+**Why this exists:** A multi-model batch that loaded mistral-24B-8bit
+→ phi-4-mini-4bit → gemma-4-26B-8bit in sequence was accumulating
+cached models until the Metal working-set limit (~51 GB on M1 Ultra)
+was exceeded. The Metal completion queue then threw an uncaught
+`std::runtime_error` propagating as `EXC_CRASH (SIGABRT)`. With the
+estimator, callers get a clean `MemoryError` refusal before touching
+Metal, rather than crashing the process mid-generate.
+
+**Supported patterns:**
+
+| Pattern | Example | Result |
+|---|---|---|
+| `<N>B` + bits | `Mistral-24B-8bit` | 24 × 1.0 = 24 GB |
+| `<N>M` + bits | `tiny-350m-4bit` | 0.350 × 0.5 = 0.175 GB |
+| Size class + bits | `phi-4-mini-4bit` | 4 × 0.5 = 2 GB (mini class) |
+| Size class + default | `foo-small` | 7 × 2.0 = 14 GB (fp16 default) |
+| Unparseable | `mystery-model` | `None` → caller falls back |
+
+Quantization multipliers: `16bit/fp16/bf16` → 2.0, `8bit/int8` → 1.0,
+`4bit/int4/q4` → 0.5, `2bit/int2` → 0.25. Default when unspecified: 2.0
+(conservative fp16 upper bound).
+
+Size-class fallbacks: `mini` → 4B, `small` → 7B, `medium` → 13B,
+`large` → 70B, `xl` → 13B.
+
+Returns `None` when no size hint is parseable so callers can fall back
+to the threshold-based `ensure_headroom` path.
+
+### AGX Driver Workaround (v0.2.2)
+
+Sets `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` at import time if not already
+set. Suggested by @zcbenz (MLX maintainer) in
+[mlx#3267](https://github.com/ml-explore/mlx/issues/3267) — relaxes
+the IOGPUFamily command buffer context store timeout to reduce kernel
+panics on long-running GPU workloads. Zero-cost, safe to set
+unconditionally.
+
+### Additional OOM Pattern (v0.2.2)
+
+`is_metal_oom` now detects the `fPendingMemorySet` panic signature
+reported in [mlx#3346](https://github.com/ml-explore/mlx/issues/3346)
+by @yoyaku155, alongside the existing `Insufficient Memory` and
+`kIOGPUCommandBufferCallbackErrorOutOfMemory` patterns.
+
 ## v0.2 Features
 
 ### OOM Recovery
@@ -272,6 +346,7 @@ A module-level singleton `metal_guard` is provided.
 |--------|-------------|
 | `can_fit(model_size_gb, overhead_gb=2.0) -> bool` | Check if model fits in available memory |
 | `require_fit(model_size_gb, model_name, overhead_gb=2.0)` | Clean up + raise MemoryError if won't fit |
+| `estimate_model_size_from_name(name) -> float \| None` *(v0.2.2, static)* | Parse param count + quantization from model name → estimated GB |
 
 ### Memory Pressure
 

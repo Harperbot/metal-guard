@@ -55,6 +55,83 @@ metal_guard.safe_cleanup()
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
 
+## v0.2.2 新機能
+
+### モデルサイズ推定器 (v0.2.2)
+
+モデル名から Metal メモリフットプリントを直接パースします。複数モデルの
+アンサンブルワークロードで ModelCache にキャッシュされた古いモデルを
+Metal のワーキングセット上限に到達する前に事前退避するための `require_fit`
+ゲートとして設計されています。
+
+```python
+from metal_guard import MetalGuard, metal_guard
+
+# 静的メソッド — インスタンス不要
+size = MetalGuard.estimate_model_size_from_name(
+    "mlx-community/Mistral-Small-24B-8bit"
+)
+# → 24.0 GB  (24B パラメータ × 1.0 bytes/param for 8-bit)
+
+size = MetalGuard.estimate_model_size_from_name(
+    "mlx-community/Phi-4-mini-instruct-4bit"
+)
+# → 2.0 GB  (mini クラスのフォールバック: 4B × 0.5 for 4-bit)
+
+# require_fit とペアでロード前ゲートとして使用
+name = "mlx-community/gemma-4-31b-8bit"
+size = MetalGuard.estimate_model_size_from_name(name)
+if size is not None:
+    metal_guard.require_fit(size, model_name=name)
+model = load(name)  # Metal に収まらない場合、ロード前に拒否される
+```
+
+**なぜ必要か**: `mistral-24B-8bit → phi-4-mini-4bit → gemma-4-26B-8bit`
+を順次ロードする複数モデルのバッチ処理では、ModelCache がすべての
+モデルを保持し続け、Metal のワーキングセット上限（M1 Ultra で約 51 GB）を
+超えてしまいます。その結果、Metal 補完キューから捕捉されていない
+`std::runtime_error` が投げられ、最終的に `EXC_CRASH (SIGABRT)` として
+プロセスが死亡します。この推定器があれば、呼び出し側は Metal に
+触れる前にクリーンな `MemoryError` 拒否を受け取れるため、generate の
+途中でクラッシュすることがなくなります。
+
+**対応パターン**:
+
+| パターン | 例 | 結果 |
+|---|---|---|
+| `<N>B` + ビット数 | `Mistral-24B-8bit` | 24 × 1.0 = 24 GB |
+| `<N>M` + ビット数 | `tiny-350m-4bit` | 0.350 × 0.5 = 0.175 GB |
+| サイズクラス + ビット数 | `phi-4-mini-4bit` | 4 × 0.5 = 2 GB (mini クラス) |
+| サイズクラス + デフォルト | `foo-small` | 7 × 2.0 = 14 GB (fp16 デフォルト) |
+| 解析不可 | `mystery-model` | `None` → 呼び出し側がフォールバック |
+
+量子化乗数: `16bit/fp16/bf16` → 2.0、`8bit/int8` → 1.0、
+`4bit/int4/q4` → 0.5、`2bit/int2` → 0.25。指定されない場合のデフォルトは
+2.0（fp16 の保守的な上限）。
+
+サイズクラスのフォールバック: `mini` → 4B、`small` → 7B、
+`medium` → 13B、`large` → 70B、`xl` → 13B。
+
+名前からサイズヒントが解析できない場合は `None` を返すため、呼び出し側は
+従来のしきい値ベースの `ensure_headroom` パスにフォールバックできます。
+
+### AGX ドライバ回避策 (v0.2.2)
+
+インポート時に `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` を設定します
+（既に設定されていない場合）。MLX メンテナ @zcbenz 氏による
+[mlx#3267](https://github.com/ml-explore/mlx/issues/3267) での提案で、
+IOGPUFamily のコマンドバッファコンテキストストアタイムアウトを
+緩和し、長時間実行される GPU ワークロードでの kernel panic を
+減らします。ゼロコスト、無条件設定で安全です。
+
+### OOM パターン追加検出 (v0.2.2)
+
+`is_metal_oom` が `fPendingMemorySet` panic シグネチャを検出するように
+なりました — @yoyaku155 氏が
+[mlx#3346](https://github.com/ml-explore/mlx/issues/3346) で報告した
+もので、既存の `Insufficient Memory` および
+`kIOGPUCommandBufferCallbackErrorOutOfMemory` パターンと並列で扱われます。
+
 ## v0.2 新機能
 
 ### OOM リカバリー
@@ -198,6 +275,7 @@ async def chat(request):
 |---------|------|
 | `can_fit(model_size_gb, overhead_gb=2.0) -> bool` | 利用可能なメモリにモデルが収まるか |
 | `require_fit(model_size_gb, model_name)` | 収まらなければクリーンアップ、それでもダメならエラー |
+| `estimate_model_size_from_name(name) -> float \| None` *(v0.2.2, 静的)* | モデル名からパラメータ数 + 量子化を解析 → 推定 GB |
 
 ### メモリ圧力
 

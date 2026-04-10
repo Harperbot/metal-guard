@@ -55,6 +55,79 @@ metal_guard.safe_cleanup()
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
 
+## v0.2.2 新功能
+
+### 模型大小估算器 (v0.2.2)
+
+直接從模型名稱解析 Metal 記憶體佔用量。設計用來搭配 `require_fit` 作為
+多模型輪流工作負載的預測性閘門 — 在撞到 Metal 工作區上限之前就主動
+卸載快取模型。
+
+```python
+from metal_guard import MetalGuard, metal_guard
+
+# 靜態方法，不需要 instance
+size = MetalGuard.estimate_model_size_from_name(
+    "mlx-community/Mistral-Small-24B-8bit"
+)
+# → 24.0 GB  (24B 參數 × 1.0 bytes/param for 8-bit)
+
+size = MetalGuard.estimate_model_size_from_name(
+    "mlx-community/Phi-4-mini-instruct-4bit"
+)
+# → 2.0 GB  (mini-class fallback: 4B × 0.5 for 4-bit)
+
+# 搭配 require_fit 作為載入前閘門
+name = "mlx-community/gemma-4-31b-8bit"
+size = MetalGuard.estimate_model_size_from_name(name)
+if size is not None:
+    metal_guard.require_fit(size, model_name=name)
+model = load(name)  # 如果 Metal 裝不下，載入前就被拒絕
+```
+
+**為什麼需要這個**：一個依序載入 mistral-24B-8bit → phi-4-mini-4bit
+→ gemma-4-26B-8bit 的多模型工作負載會讓 ModelCache 持續累積，直到
+超過 Metal 工作區上限（M1 Ultra 約 51 GB）。Metal completion queue
+會丟出未捕捉的 `std::runtime_error`，最終變成 `EXC_CRASH (SIGABRT)`
+殺掉整個 process。有了這個估算器之後，呼叫方可以在真正碰到 Metal 前
+就拿到乾淨的 `MemoryError`，而不是 generate 到一半才 crash。
+
+**支援的格式**：
+
+| 格式 | 範例 | 結果 |
+|---|---|---|
+| `<N>B` + 位元 | `Mistral-24B-8bit` | 24 × 1.0 = 24 GB |
+| `<N>M` + 位元 | `tiny-350m-4bit` | 0.350 × 0.5 = 0.175 GB |
+| 大小類別 + 位元 | `phi-4-mini-4bit` | 4 × 0.5 = 2 GB（mini 類別） |
+| 大小類別 + 預設 | `foo-small` | 7 × 2.0 = 14 GB（fp16 預設） |
+| 無法解析 | `mystery-model` | `None` → 呼叫方走舊路徑 |
+
+量化倍率：`16bit/fp16/bf16` → 2.0、`8bit/int8` → 1.0、
+`4bit/int4/q4` → 0.5、`2bit/int2` → 0.25。未指定時預設為 2.0
+（保守的 fp16 上限）。
+
+大小類別 fallback：`mini` → 4B、`small` → 7B、`medium` → 13B、
+`large` → 70B、`xl` → 13B。
+
+無法從名稱解析時回傳 `None`，呼叫方可以 fallback 到原本門檻式的
+`ensure_headroom` 路徑。
+
+### AGX 驅動程式繞過 (v0.2.2)
+
+import 時自動設定 `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1`（若尚未設定）。
+這是 MLX 維護者 @zcbenz 在
+[mlx#3267](https://github.com/ml-explore/mlx/issues/3267) 的建議 —
+放寬 IOGPUFamily 的 command buffer context store timeout，可減少
+長時間 GPU 工作負載的 kernel panic。零成本，無條件設定安全。
+
+### 新增 OOM 偵測模式 (v0.2.2)
+
+`is_metal_oom` 現在會偵測 `fPendingMemorySet` 這個 panic 訊號 —
+由 @yoyaku155 在
+[mlx#3346](https://github.com/ml-explore/mlx/issues/3346) 回報 —
+跟原本的 `Insufficient Memory` 和
+`kIOGPUCommandBufferCallbackErrorOutOfMemory` 並列。
+
 ## v0.2 新功能
 
 ### OOM 復原
@@ -201,6 +274,7 @@ async def chat(request):
 |------|------|
 | `can_fit(model_size_gb, overhead_gb=2.0) -> bool` | 模型能否放進可用記憶體 |
 | `require_fit(model_size_gb, model_name)` | 放不下就清理，還不行就報錯 |
+| `estimate_model_size_from_name(name) -> float \| None` *(v0.2.2, 靜態)* | 從模型名稱解析參數量 + 量化等級 → 估算 GB |
 
 ### 記憶體壓力
 
