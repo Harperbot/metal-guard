@@ -513,11 +513,13 @@ class MetalGuard:
                 break
 
         # Parameter count (billions)
-        # Explicit B/M suffix: "24b", "31b", "350m" — the negative lookahead
-        # (?![a-z]) prevents matching things like "4bit" (b followed by i)
-        # or "modern" (m followed by o).
+        # Explicit B/M suffix: "24b", "31b", "350m" — word-boundary anchors
+        # require the token to be standalone, which rejects things like
+        # "8bit" (where 'b' is inside "bit") and "some-24beauty" while
+        # still matching "24b", "1.5B", "350m" when they appear as full
+        # tokens. More robust than the earlier (?![a-z]) lookahead.
         params_b: float | None = None
-        match = re.search(r"(\d+(?:\.\d+)?)\s*([bm])(?![a-z])", name)
+        match = re.search(r"\b(\d+(?:\.\d+)?)\s*([bm])\b", name)
         if match:
             value = float(match.group(1))
             unit = match.group(2)
