@@ -260,6 +260,87 @@ class TestCanFit:
             guard.require_fit(24.0, model_name="huge-model")
 
 
+# ── Model size estimator ─────────────────────────────────────────────────
+
+
+class TestEstimateModelSize:
+    """Model-name heuristic sizing for require_fit pre-load gates."""
+
+    def test_billion_params_with_8bit(self):
+        """24B × 8bit (1.0 bytes/param) = 24 GB."""
+        assert MetalGuard.estimate_model_size_from_name(
+            "mlx-community/Mistral-Small-3.2-24B-Instruct-2506-8bit"
+        ) == pytest.approx(24.0)
+
+    def test_billion_params_with_4bit(self):
+        """31B × 4bit (0.5 bytes/param) = 15.5 GB."""
+        assert MetalGuard.estimate_model_size_from_name(
+            "mlx-community/gemma-4-31b-4bit"
+        ) == pytest.approx(15.5)
+
+    def test_billion_params_with_2bit(self):
+        """2B × 2bit (0.25 bytes/param) = 0.5 GB."""
+        assert MetalGuard.estimate_model_size_from_name(
+            "mlx-community/tiny-2b-2bit"
+        ) == pytest.approx(0.5)
+
+    def test_fp16_default_when_bits_missing(self):
+        """7B with no quant hint assumes fp16 → 14 GB upper bound."""
+        assert MetalGuard.estimate_model_size_from_name(
+            "Llama-7B-Instruct"
+        ) == pytest.approx(14.0)
+
+    def test_million_params(self):
+        """350m × fp16 (2.0) = 0.7 GB."""
+        assert MetalGuard.estimate_model_size_from_name(
+            "tiny-350m"
+        ) == pytest.approx(0.7)
+
+    def test_mini_size_class_fallback(self):
+        """phi-4-mini-4bit → mini (4B) × 4bit (0.5) = 2.0 GB."""
+        assert MetalGuard.estimate_model_size_from_name(
+            "mlx-community/Phi-4-mini-instruct-4bit"
+        ) == pytest.approx(2.0)
+
+    def test_small_size_class_fallback(self):
+        """foo-small-8bit → small (7B) × 8bit (1.0) = 7.0 GB."""
+        assert MetalGuard.estimate_model_size_from_name(
+            "foo-small-8bit"
+        ) == pytest.approx(7.0)
+
+    def test_large_size_class_fallback(self):
+        """bar-large (no quant) → large (70B) × fp16 (2.0) = 140 GB."""
+        assert MetalGuard.estimate_model_size_from_name(
+            "bar-large"
+        ) == pytest.approx(140.0)
+
+    def test_returns_none_for_unparseable(self):
+        """Names without any size hints must return None so callers can
+        fall back to threshold-based checks."""
+        assert MetalGuard.estimate_model_size_from_name("mystery-model") is None
+        assert MetalGuard.estimate_model_size_from_name("random-name") is None
+        assert MetalGuard.estimate_model_size_from_name("") is None
+
+    def test_returns_none_for_none_input(self):
+        assert MetalGuard.estimate_model_size_from_name(None) is None  # type: ignore[arg-type]
+
+    def test_does_not_match_version_numbers(self):
+        """Version strings like '2506' or '3.2' must not be parsed as
+        parameter counts. Only explicit <N>B / <N>M suffixes."""
+        # '2506-8bit' — regex sees '8b' but negative lookahead (?![a-z])
+        # rejects 'bit', and '2506' has no trailing B/M → fallback to None
+        # unless another hint matches. In this name, 'Small' triggers the
+        # size-class fallback to 7B. × 8bit → 7.0 GB.
+        assert MetalGuard.estimate_model_size_from_name(
+            "Mistral-Small-3.2-Instruct-2506-8bit"
+        ) == pytest.approx(7.0)
+
+    def test_bare_quant_hint_alone_returns_none(self):
+        """'8bit' alone without any param-count hint returns None — the
+        function refuses to guess at a size from quantization alone."""
+        assert MetalGuard.estimate_model_size_from_name("some-model-8bit") is None
+
+
 # ── Memory pressure ──────────────────────────────────────────────────────
 
 

@@ -71,17 +71,29 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, TypeVar
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 log = logging.getLogger("metal_guard")
 
 T = TypeVar("T")
 
-# Pattern to detect Metal OOM errors from the C++ runtime.
-# These surface as RuntimeError in Python with this specific message.
+# ── Apple GPU driver workaround ─────────────────────────────────────────
+# Suggested by @zcbenz (MLX maintainer) in mlx#3267:
+# Relaxes the command buffer context store timeout to reduce kernel panics
+# on long-running GPU workloads.  Zero-cost — just an env var hint to the
+# IOGPUFamily driver.  Safe to set unconditionally.
+if "AGX_RELAX_CDM_CTXSTORE_TIMEOUT" not in os.environ:
+    os.environ["AGX_RELAX_CDM_CTXSTORE_TIMEOUT"] = "1"
+
+# Pattern to detect Metal OOM / GPU memory errors from the C++ runtime.
+# Sources:
+#   - "Command buffer execution failed...Insufficient Memory" (mlx-lm#883, #1015)
+#   - "kIOGPUCommandBufferCallbackErrorOutOfMemory" (mlx-lm#854)
+#   - "fPendingMemorySet" (mlx#3346 @yoyaku155 — second panic signature)
 _METAL_OOM_PATTERN = re.compile(
     r"Command buffer execution failed.*Insufficient Memory"
-    r"|kIOGPUCommandBufferCallbackErrorOutOfMemory",
+    r"|kIOGPUCommandBufferCallbackErrorOutOfMemory"
+    r"|fPendingMemorySet",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -438,6 +450,102 @@ class MetalGuard:
                 f"even after cleanup. Available: {stats.available_gb:.1f}GB, "
                 f"needed: {model_size_gb + overhead_gb:.1f}GB"
             )
+
+    @staticmethod
+    def estimate_model_size_from_name(model_name: str) -> float | None:
+        """Heuristically estimate a model's Metal footprint from its name.
+
+        Parses patterns like ``Mistral-Small-24B-8bit`` → ``24 * 1.0 = 24 GB``
+        or ``Phi-4-mini-instruct-4bit`` → ``4 * 0.5 = 2 GB`` (mini-class fallback
+        estimate). Returns ``None`` when no size hint is found — callers should
+        treat that as "unknown, skip the fit check" and fall back to the
+        threshold-based ``ensure_headroom`` path.
+
+        Designed to pair with ``require_fit`` so multi-model batch workloads
+        (e.g. an MLX ensemble that loads several debaters sequentially) can
+        proactively evict cached models before hitting the Metal working-set
+        limit, instead of failing with an uncaught ``std::runtime_error``
+        from the Metal completion queue.
+
+        Supported param-count patterns (case-insensitive):
+          <N>B    → N billion parameters   (e.g. "24B", "31B")
+          <N>M    → N million parameters (×0.001 GB)
+          mini    → 4 billion fallback (phi-4-mini class)
+          small   → 7 billion fallback
+          medium  → 13 billion fallback
+          large   → 70 billion fallback
+          xl      → 13 billion fallback
+
+        Supported quantization multipliers (bytes per parameter, decimal GB):
+          16bit / fp16 / bf16 → 2.0
+          8bit / int8        → 1.0
+          4bit / int4 / q4   → 0.5
+          2bit / int2        → 0.25
+          (default when unspecified: 2.0, assumes fp16)
+
+        The result is a rough upper bound intended for pre-load gating —
+        callers should not use it for precise accounting.
+
+        Usage::
+
+            size = MetalGuard.estimate_model_size_from_name(
+                "mlx-community/Mistral-Small-24B-8bit"
+            )
+            if size is not None:
+                metal_guard.require_fit(size, model_name="Mistral-24B")
+            model = load("mlx-community/Mistral-Small-24B-8bit")
+
+        """
+        if not model_name:
+            return None
+        name = model_name.lower()
+
+        # Quantization multiplier (bytes per param)
+        bit_mult: float | None = None
+        for pat, mult in (
+            (r"16bit|fp16|bf16", 2.0),
+            (r"8bit|int8", 1.0),
+            (r"4bit|int4|q4", 0.5),
+            (r"2bit|int2", 0.25),
+        ):
+            if re.search(pat, name):
+                bit_mult = mult
+                break
+
+        # Parameter count (billions)
+        # Explicit B/M suffix: "24b", "31b", "350m" — the negative lookahead
+        # (?![a-z]) prevents matching things like "4bit" (b followed by i)
+        # or "modern" (m followed by o).
+        params_b: float | None = None
+        match = re.search(r"(\d+(?:\.\d+)?)\s*([bm])(?![a-z])", name)
+        if match:
+            value = float(match.group(1))
+            unit = match.group(2)
+            params_b = value if unit == "b" else value / 1000.0
+        else:
+            # Size class fallback when the name has a keyword but no explicit
+            # parameter count (e.g. "phi-4-mini-instruct-4bit").
+            for pat, size in (
+                ("mini", 4.0),
+                ("small", 7.0),
+                ("medium", 13.0),
+                ("large", 70.0),
+                ("xl", 13.0),
+            ):
+                if pat in name:
+                    params_b = size
+                    break
+
+        if params_b is None:
+            # Without a param count, we can't estimate at all — let the
+            # caller fall back to ensure_headroom threshold checks.
+            return None
+
+        # Default to fp16 (conservative upper bound) when bits are unspecified.
+        if bit_mult is None:
+            bit_mult = 2.0
+
+        return params_b * bit_mult
 
     # ── Memory pressure ──────────────────────────────────────────────
 
