@@ -6,6 +6,8 @@
 
 防止因 Metal 驅動程式 bug 導致的 kernel panic 和 OOM crash——特別是多模型管線、長時間運行的伺服器，以及大量 tool calling 的 agent 框架。
 
+**目前版本：** v0.2.3 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 問題是什麼
 
 Apple Silicon 的 Metal GPU 驅動程式有一個 bug：**當 GPU 記憶體管理失敗時，它不會優雅地殺掉 process，而是直接讓整台電腦 kernel panic 重開機。**

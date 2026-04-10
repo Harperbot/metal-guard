@@ -6,6 +6,8 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
+**Current version:** v0.2.3 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
+
 ## The Problem
 
 Apple's Metal GPU driver on Apple Silicon has a bug: when GPU memory management fails, **the kernel panics the entire machine** instead of gracefully killing the process.
