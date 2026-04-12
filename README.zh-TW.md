@@ -6,7 +6,7 @@
 
 防止因 Metal 驅動程式 bug 導致的 kernel panic 和 OOM crash——特別是多模型管線、長時間運行的伺服器，以及大量 tool calling 的 agent 框架。
 
-**目前版本：** v0.3.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
+**目前版本：** v0.3.1 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 問題是什麼
 
@@ -56,6 +56,36 @@ metal_guard.safe_cleanup()
 # 3. 載入前檢查記憶體
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
+
+## v0.3.1 新功能
+
+### 跨 Process 互斥鎖（Layer 8）
+
+基於檔案的鎖機制，防止跨 process 的 MLX 工作負載同時執行。這是 `mlx_lm.server`、benchmark 或直接 `mlx_lm.generate` 呼叫與其他 MLX process 同時運行時導致 kernel panic 的根本原因。
+
+```python
+from metal_guard import mlx_exclusive_lock, acquire_mlx_lock, release_mlx_lock
+
+# Context manager（推薦）
+with mlx_exclusive_lock("my_script"):
+    model, tokenizer = mlx_lm.load("mlx-community/gemma-4-31b-it-8bit")
+    result = mlx_lm.generate(model, tokenizer, prompt="Hello")
+
+# 明確的 acquire/release
+acquire_mlx_lock("my_server")
+try:
+    serve_forever()
+finally:
+    release_mlx_lock()
+
+# 檢查但不阻擋
+from metal_guard import read_mlx_lock
+info = read_mlx_lock()  # 空閒回傳 None，有人持有回傳 dict（含 pid/label/cmdline）
+```
+
+**自我修復：** 從 crash process 留下的過期 lock 會透過 pid 存活檢查自動清理。crash 後不需要手動清理。
+
+**衝突時拋出 `MLXLockConflict`**，包含持有者的 pid、label 和 cmdline，讓你看到清楚的錯誤訊息而不是 kernel panic。
 
 ## v0.3.0 新功能
 
@@ -318,6 +348,15 @@ async def chat(request):
 ```
 
 ## API 參考
+
+### 跨 Process 鎖 (v0.3.1)
+
+| 方法 | 說明 |
+|------|------|
+| `acquire_mlx_lock(label, force=False)` | 取得跨 process 獨佔鎖。有人持有時拋出 `MLXLockConflict` |
+| `release_mlx_lock() -> bool` | 釋放鎖（僅當本 process 持有時） |
+| `read_mlx_lock() -> dict \| None` | 檢查鎖狀態，不阻擋。自動清理過期鎖 |
+| `mlx_exclusive_lock(label)` | Context manager：進入時取得，離開時釋放 |
 
 ### Thread 追蹤
 

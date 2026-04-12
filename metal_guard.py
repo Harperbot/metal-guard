@@ -66,17 +66,20 @@ License: MIT
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import re
 import signal
+import sys
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Generator, TypeVar
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 log = logging.getLogger("metal_guard")
 
@@ -972,6 +975,126 @@ class MetalGuard:
                 os.fsync(f.fileno())
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Cross-process mutual exclusion (Layer 8)
+# ---------------------------------------------------------------------------
+
+_PROCESS_LOCK_PATH = Path.home() / ".metal-guard" / "locks" / "mlx_exclusive.lock"
+
+
+class MLXLockConflict(RuntimeError):
+    """Raised when another live process already holds the MLX lock."""
+
+    def __init__(self, holder: dict[str, Any]):
+        self.holder = holder
+        label = holder.get("label", "unknown")
+        pid = holder.get("pid", "?")
+        started = holder.get("started_at", "?")
+        cmdline = holder.get("cmdline", "")
+        super().__init__(
+            f"MLX lock held by {label} (pid={pid}, since {started}). "
+            f"cmdline: {cmdline!r}. "
+            f"Concurrent MLX workloads trigger Metal kernel panics — "
+            f"wait for the other process to finish, or pass force=True."
+        )
+
+
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_mlx_lock() -> dict[str, Any] | None:
+    """Return the current lock holder's info dict, or None if free.
+
+    Self-healing: if the recorded pid is dead, the stale lock is removed.
+    """
+    if not _PROCESS_LOCK_PATH.exists():
+        return None
+    try:
+        raw = _PROCESS_LOCK_PATH.read_text()
+    except OSError:
+        return None
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError:
+        _PROCESS_LOCK_PATH.unlink(missing_ok=True)
+        return None
+    pid = info.get("pid")
+    if not isinstance(pid, int) or not _is_pid_alive(pid):
+        _PROCESS_LOCK_PATH.unlink(missing_ok=True)
+        return None
+    return info
+
+
+def acquire_mlx_lock(label: str, *, force: bool = False) -> dict[str, Any]:
+    """Acquire the cross-process MLX exclusive lock.
+
+    Raises MLXLockConflict when another live process holds the lock
+    and force=False.
+    """
+    _PROCESS_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if not force:
+        holder = read_mlx_lock()
+        if holder is not None and holder.get("pid") != os.getpid():
+            raise MLXLockConflict(holder)
+
+    info: dict[str, Any] = {
+        "pid": os.getpid(),
+        "label": label,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "cmdline": " ".join(sys.argv)[:300] if hasattr(sys, "argv") else f"pid:{os.getpid()}",
+    }
+    tmp = _PROCESS_LOCK_PATH.with_suffix(f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(json.dumps(info, indent=2))
+        os.replace(str(tmp), str(_PROCESS_LOCK_PATH))
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+    return info
+
+
+def release_mlx_lock() -> bool:
+    """Release the MLX lock if this process holds it."""
+    info = read_mlx_lock()
+    if info is None:
+        return False
+    if info.get("pid") != os.getpid():
+        return False
+    _PROCESS_LOCK_PATH.unlink(missing_ok=True)
+    return True
+
+
+@contextmanager
+def mlx_exclusive_lock(
+    label: str,
+    *,
+    force: bool = False,
+) -> Generator[dict[str, Any], None, None]:
+    """Context manager: acquire on enter, always release on exit.
+
+    Example::
+
+        with mlx_exclusive_lock("my_script"):
+            model, tokenizer = mlx_lm.load("mlx-community/gemma-4-31b-it-8bit")
+            result = mlx_lm.generate(model, tokenizer, prompt="Hello")
+    """
+    info = acquire_mlx_lock(label, force=force)
+    try:
+        yield info
+    finally:
+        release_mlx_lock()
 
 
 # ---------------------------------------------------------------------------

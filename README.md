@@ -6,7 +6,7 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version:** v0.3.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
+**Current version:** v0.3.1 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## The Problem
 
@@ -76,6 +76,36 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 # 4. Breadcrumbs for crash forensics
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
 ```
+
+## v0.3.1 Features
+
+### Cross-Process Mutual Exclusion (Layer 8)
+
+File-based lock that prevents concurrent MLX workloads across process boundaries. This is the root cause of kernel panics when `mlx_lm.server`, benchmarks, or direct `mlx_lm.generate` calls run simultaneously with other MLX processes.
+
+```python
+from metal_guard import mlx_exclusive_lock, acquire_mlx_lock, release_mlx_lock
+
+# Context manager (preferred)
+with mlx_exclusive_lock("my_script"):
+    model, tokenizer = mlx_lm.load("mlx-community/gemma-4-31b-it-8bit")
+    result = mlx_lm.generate(model, tokenizer, prompt="Hello")
+
+# Explicit acquire/release
+acquire_mlx_lock("my_server")
+try:
+    serve_forever()
+finally:
+    release_mlx_lock()
+
+# Check without blocking
+from metal_guard import read_mlx_lock
+info = read_mlx_lock()  # None if free, dict with pid/label/cmdline if held
+```
+
+**Self-healing:** Stale locks from crashed processes are automatically cleaned up via pid liveness checks. No manual cleanup needed after crashes.
+
+**Raises `MLXLockConflict`** with the holder's pid, label, and cmdline when another live process holds the lock — so you get a clear error message instead of a kernel panic.
 
 ## v0.3.0 Features
 
@@ -399,6 +429,15 @@ MetalGuard(cooldown_secs=2.0, thread_timeout_secs=30.0, breadcrumb_path="logs/me
 
 A module-level singleton `metal_guard` is provided.
 
+### Cross-Process Lock (v0.3.1)
+
+| Method | Description |
+|--------|-------------|
+| `acquire_mlx_lock(label, force=False)` | Acquire exclusive cross-process lock. Raises `MLXLockConflict` if held |
+| `release_mlx_lock() -> bool` | Release lock if this process holds it |
+| `read_mlx_lock() -> dict \| None` | Inspect lock without blocking. Self-heals stale locks |
+| `mlx_exclusive_lock(label)` | Context manager: acquire on enter, release on exit |
+
 ### Thread Tracking
 
 | Method | Description |
@@ -468,6 +507,7 @@ A module-level singleton `metal_guard` is provided.
 ┌──────────────────▼──────────────────────────────┐
 │              MetalGuard                         │
 │                                                 │
+│  Process Lock ─────── cross-process exclusion   │
 │  Thread Registry ──── wait before cleanup       │
 │  Safe Cleanup ─────── gc + flush + cooldown     │
 │  OOM Recovery ─────── catch + cleanup + retry   │

@@ -5,6 +5,28 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] — 2026-04-13
+
+### Added
+
+- **Cross-process mutual exclusion (Layer 8)** — `acquire_mlx_lock()`,
+  `release_mlx_lock()`, `read_mlx_lock()`, and `mlx_exclusive_lock()` context
+  manager. File-based lock at `~/.metal-guard/locks/mlx_exclusive.lock`
+  prevents concurrent MLX workloads across process boundaries — the root
+  cause of IOGPUMemory kernel panics when `mlx_lm.server`, benchmarks, or
+  direct `mlx_lm.generate` calls run simultaneously with other MLX processes.
+  Stale locks from crashed processes are self-healing (pid liveness check).
+  New `MLXLockConflict` exception raised when a live process already holds
+  the lock.
+
+  ```python
+  from metal_guard import mlx_exclusive_lock
+
+  with mlx_exclusive_lock("my_script"):
+      model, tokenizer = mlx_lm.load("mlx-community/gemma-4-31b-it-8bit")
+      result = mlx_lm.generate(model, tokenizer, prompt="Hello")
+  ```
+
 ## [0.3.0] — 2026-04-12
 
 ### Added
