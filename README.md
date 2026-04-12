@@ -6,7 +6,7 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version:** v0.2.3 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
+**Current version:** v0.3.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## The Problem
 
@@ -76,6 +76,39 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 # 4. Breadcrumbs for crash forensics
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
 ```
+
+## v0.3.0 Features
+
+### Pre-generate Metal Health Probe
+
+Verify the Metal command queue is alive before starting a long `generate()` call. If the GPU is in a bad state from a prior crash, this fails at a controlled point (~1ms) instead of mid-inference.
+
+```python
+metal_guard.probe_metal_health()  # crash here, not mid-generate
+result = generate(model, tokenizer, prompt=prompt)
+```
+
+### SIGABRT Signal Handler (Crash Forensics)
+
+MLX's C++ runtime can throw exceptions from Metal's GCD CompletionQueueDispatch queue — a code path Python cannot catch. When this happens, `std::terminate` calls `abort()` and the process dies. This handler writes a final breadcrumb before the crash for post-mortem analysis.
+
+```python
+metal_guard.install_abort_handler()  # call once at startup
+# ... later, if Metal SIGABRT occurs:
+# → breadcrumb written: "SIGABRT: Metal command buffer error detected..."
+# → log.critical written
+# → process terminates with proper crash report
+```
+
+### 6-bit / 3-bit / mxfp4 Estimator Fix
+
+`estimate_model_size_from_name()` now supports mixed-precision and emerging quantization formats:
+
+| Format | Multiplier | Example |
+|---|---|---|
+| `6bit` | 0.75 | `LFM2-24B-A2B-MLX-6bit` → 18 GB (was incorrectly 48 GB) |
+| `3bit` / `int3` | 0.375 | TurboQuant 3-bit KV cache models |
+| `mxfp4` | 0.5 | Metal FP4 mixed-precision format |
 
 ## v0.2.3 Features
 

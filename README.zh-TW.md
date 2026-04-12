@@ -6,7 +6,7 @@
 
 防止因 Metal 驅動程式 bug 導致的 kernel panic 和 OOM crash——特別是多模型管線、長時間運行的伺服器，以及大量 tool calling 的 agent 框架。
 
-**目前版本：** v0.2.3 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
+**目前版本：** v0.3.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 問題是什麼
 
@@ -56,6 +56,35 @@ metal_guard.safe_cleanup()
 # 3. 載入前檢查記憶體
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
+
+## v0.3.0 新功能
+
+### Pre-generate Metal 健康探測
+
+在開始長時間 `generate()` 前驗證 Metal command queue 是否正常。如果 GPU 因先前 crash 處於異常狀態，會在受控時機（~1ms）失敗，而不是在推論途中掛掉。
+
+```python
+metal_guard.probe_metal_health()  # 在這裡掛，不在 generate 中間
+result = generate(model, tokenizer, prompt=prompt)
+```
+
+### SIGABRT 信號處理（crash forensics）
+
+MLX 的 C++ runtime 會從 Metal 的 GCD CompletionQueueDispatch queue 拋出 exception——Python 無法攔截。此 handler 在 process 死亡前寫入最後的 breadcrumb，供事後分析。
+
+```python
+metal_guard.install_abort_handler()  # 啟動時呼叫一次
+```
+
+### 6-bit / 3-bit / mxfp4 模型大小估算修正
+
+`estimate_model_size_from_name()` 新增混合精度和新量化格式支援：
+
+| 格式 | 乘數 | 範例 |
+|---|---|---|
+| `6bit` | 0.75 | `LFM2-24B-A2B-MLX-6bit` → 18 GB（之前錯誤估為 48 GB）|
+| `3bit` / `int3` | 0.375 | TurboQuant 3-bit KV cache 模型 |
+| `mxfp4` | 0.5 | Metal FP4 混合精度格式 |
 
 ## v0.2.3 新功能
 

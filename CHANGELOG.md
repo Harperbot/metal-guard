@@ -5,6 +5,45 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] — 2026-04-12
+
+### Added
+
+- **Pre-generate Metal health probe** — `probe_metal_health()` runs a tiny
+  `mx.eval(mx.zeros(1))` to verify the Metal command queue is alive before
+  starting a long generate call. If the GPU is in a bad state from a prior
+  crash (stale command queue, leaked buffers), this crashes at a controlled
+  point instead of mid-inference. Costs ~1ms.
+
+- **SIGABRT signal handler** — `install_abort_handler()` installs a
+  Python-level `signal.SIGABRT` handler for crash forensics. When MLX's
+  `check_error(MTL::CommandBuffer*)` throws a C++ exception from the Metal
+  GCD CompletionQueueDispatch queue (which Python cannot catch), the handler
+  writes a final breadcrumb and logs at CRITICAL before re-raising for a
+  proper crash report. Does not attempt recovery — Metal state is corrupt.
+  Observed in production: 2026-04-12 18:30 SIGABRT on Thread 34
+  `com.Metal.CompletionQueueDispatch`.
+
+- **6-bit / 3-bit / mxfp4 quantization support** in
+  `estimate_model_size_from_name()`. Fixes a bug where 6-bit models
+  (e.g. `LFM2-24B-A2B-MLX-6bit`) fell back to fp16 estimation (48 GB
+  instead of correct 18 GB), causing spurious `MemoryError` from
+  `require_fit`. New multipliers:
+  - `6bit` → 0.75 bytes/param
+  - `3bit` / `int3` → 0.375 bytes/param
+  - `mxfp4` → 0.5 bytes/param (alias for Metal FP4 format)
+
+### Fixed
+
+- `estimate_model_size_from_name` no longer returns wildly inflated
+  estimates for mixed-precision MLX models (unsloth UD-MLX, lmstudio
+  community 6-bit variants).
+
+### Changed
+
+- Root causes documentation updated to include cause #3: Metal
+  CommandBuffer completion error (C++ exception on GCD queue, SIGABRT).
+
 ## [0.2.3] — 2026-04-10
 
 ### Added
@@ -103,6 +142,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Module-level `_MLX_CALL_LOCK`** (in `inference.py` client wrapper)
   to serialize in-process MLX backend calls.
 
+[0.3.0]: https://github.com/harper-systems/metal-guard/releases/tag/v0.3.0
 [0.2.3]: https://github.com/harper-systems/metal-guard/releases/tag/v0.2.3
 [0.2.2]: https://github.com/harper-systems/metal-guard/releases/tag/v0.2.2
 [0.2.1]: https://github.com/harper-systems/metal-guard/releases/tag/v0.2.1

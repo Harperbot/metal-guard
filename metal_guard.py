@@ -16,6 +16,10 @@ Root causes identified:
   2. Unconditional Metal initialization — calling mx.eval()/mx.clear_cache()
      when no models are loaded still initializes the Metal driver, which can
      panic if the driver is in an unstable state from prior crashes
+  3. Metal CommandBuffer completion error — C++ exception thrown from
+     mlx::core::gpu::check_error() inside Metal's GCD CompletionQueueDispatch,
+     which cannot be caught by Python (triggers std::terminate → abort).
+     Observed in production: SIGABRT on Thread "com.Metal.CompletionQueueDispatch"
 
 Reference: https://github.com/ml-explore/mlx-lm/issues/883
 Related:
@@ -65,13 +69,14 @@ import gc
 import logging
 import os
 import re
+import signal
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, TypeVar
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -552,10 +557,12 @@ class MetalGuard:
           xl      → 13 billion fallback
 
         Supported quantization multipliers (bytes per parameter, decimal GB):
-          16bit / fp16 / bf16 → 2.0
-          8bit / int8        → 1.0
-          4bit / int4 / q4   → 0.5
-          2bit / int2        → 0.25
+          16bit / fp16 / bf16  → 2.0
+          8bit / int8          → 1.0
+          6bit                 → 0.75
+          4bit / int4 / q4 / mxfp4 → 0.5
+          3bit / int3          → 0.375
+          2bit / int2          → 0.25
           (default when unspecified: 2.0, assumes fp16)
 
         The result is a rough upper bound intended for pre-load gating —
@@ -580,7 +587,9 @@ class MetalGuard:
         for pat, mult in (
             (r"16bit|fp16|bf16", 2.0),
             (r"8bit|int8", 1.0),
-            (r"4bit|int4|q4", 0.5),
+            (r"6bit", 0.75),
+            (r"4bit|int4|q4|mxfp4", 0.5),
+            (r"3bit|int3", 0.375),
             (r"2bit|int2", 0.25),
         ):
             if re.search(pat, name):
@@ -845,6 +854,101 @@ class MetalGuard:
             log.debug("Watchdog error (non-fatal): %s", exc)
         finally:
             self._schedule_next_flush()
+
+    # ── Pre-generate Metal health probe ─────────────────────────────
+
+    def probe_metal_health(self) -> bool:
+        """Run a tiny Metal operation to verify the command queue is alive.
+
+        Call this before starting a generate() call. If the Metal driver
+        is in a bad state from a prior crash (stale command queue, leaked
+        buffers), this probe will crash *here* rather than during a long
+        generate that has already consumed minutes of work.
+
+        Returns True if the probe succeeded, False if MLX is not installed.
+        Raises whatever Metal/MLX raises if the GPU is unhealthy — callers
+        should wrap this in try/except if they want to handle the failure.
+
+        Introduced after observing production SIGABRT (2026-04-12 18:30)
+        where ``mlx::core::gpu::check_error(MTL::CommandBuffer*)`` threw a
+        C++ exception on the Metal CompletionQueueDispatch queue. A health
+        probe before generate would have caught this at a controlled point
+        instead of mid-inference.
+
+        Usage::
+
+            metal_guard.probe_metal_health()  # crash here, not mid-generate
+            result = generate(model, tokenizer, prompt=prompt)
+        """
+        try:
+            import mlx.core as mx
+        except ImportError:
+            return False
+        self.breadcrumb("PROBE: Metal health check START")
+        mx.eval(mx.zeros(1))  # ~1ms — exercises command queue round-trip
+        self.breadcrumb("PROBE: Metal health check OK")
+        return True
+
+    # ── SIGABRT signal handler (crash forensics) ─────────────────────
+
+    def install_abort_handler(self) -> None:
+        """Install a SIGABRT handler for crash forensics.
+
+        When MLX's ``check_error(MTL::CommandBuffer*)`` detects a Metal
+        command buffer error, it throws a C++ exception from inside the
+        Metal GCD CompletionQueueDispatch queue. Since this happens outside
+        any Python try/except scope, the C++ runtime calls
+        ``std::terminate`` → ``abort()`` → SIGABRT.
+
+        Python **cannot prevent** this crash (the C++ throw → terminate
+        path is not catchable from Python), but it **can** install a
+        ``signal.SIGABRT`` handler that runs before the process dies.
+
+        This handler:
+          1. Writes a breadcrumb with the last known context
+          2. Logs the event at CRITICAL level
+          3. Does NOT attempt recovery (Metal state is corrupt)
+          4. Re-raises SIGABRT with the default handler to produce a
+             proper core dump / crash report
+
+        Call this once at process startup (before any MLX work)::
+
+            metal_guard.install_abort_handler()
+
+        .. note::
+
+           The handler may not run in all cases — if ``abort()`` is called
+           from a non-main thread (which is the case for Metal's
+           CompletionQueueDispatch), Python's signal handling has
+           limitations. On macOS, ``signal.signal`` handlers are only
+           guaranteed to run on the main thread. For GCD queue crashes,
+           the breadcrumb from ``probe_metal_health()`` or the last
+           ``breadcrumb()`` call is more reliable for forensics.
+        """
+        self._original_sigabrt = signal.getsignal(signal.SIGABRT)
+
+        def _abort_handler(signum: int, frame: Any) -> None:
+            # Best-effort forensics — Metal state is already corrupt.
+            try:
+                self.breadcrumb(
+                    "SIGABRT: Metal command buffer error detected. "
+                    "This is a C++ exception from mlx::core::gpu::check_error() "
+                    "on the Metal CompletionQueueDispatch queue. "
+                    "Cannot recover — writing forensic breadcrumb."
+                )
+                log.critical(
+                    "SIGABRT caught by MetalGuard. Metal GPU state is corrupt. "
+                    "Last breadcrumb written. Process will terminate."
+                )
+            except Exception:
+                pass  # Cannot risk another exception during signal handling
+            # Restore default handler and re-raise for proper crash report
+            signal.signal(signal.SIGABRT, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGABRT)
+
+        signal.signal(signal.SIGABRT, _abort_handler)
+        self.breadcrumb("SIGABRT handler installed")
+        log.info("MetalGuard SIGABRT handler installed (crash forensics)")
 
     # ── Breadcrumb ───────────────────────────────────────────────────
 
