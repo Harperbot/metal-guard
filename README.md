@@ -6,7 +6,7 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version:** v0.3.1 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
+**Current version:** v0.4.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## The Problem
 
@@ -77,7 +77,60 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
 ```
 
-## v0.3.1 Features
+## v0.4.0 Features
+
+### Hardware-Aware Auto-Configuration
+
+Different Apple Silicon machines need different safety thresholds. An 8GB MacBook Air can't use the same settings as a 512GB Mac Studio. MetalGuard now detects your hardware and recommends appropriate values.
+
+```python
+from metal_guard import MetalGuard
+
+config = MetalGuard.recommended_config()
+print(f"{config['chip']} ({config['gpu_memory_gb']}GB) → tier: {config['tier']}")
+# Apple M1 Ultra (64.0GB) → tier: mid
+
+# Use recommended values directly
+metal_guard.start_watchdog(
+    warn_pct=config["watchdog_warn_pct"],
+    critical_pct=config["watchdog_critical_pct"],
+)
+```
+
+| Tier | Memory | Warn | Critical | Max Models |
+|------|--------|------|----------|------------|
+| low | 8–16 GB | 60% | 75% | 1 |
+| mid | 32–64 GB | 67% | 82% | 2 |
+| high | 96–512 GB | 70% | 85% | 3 |
+
+### KV Cache Growth Monitor
+
+For long-running servers where KV cache grows unbounded across conversations. Tracks memory growth rate over a sliding window and fires a callback before OOM. Addresses [mlx-lm#1047](https://github.com/ml-explore/mlx-lm/issues/1047).
+
+```python
+def handle_pressure(available_gb, growth_rate):
+    log.warning("KV pressure: %.1fGB free, growing %.1fGB/min", available_gb, growth_rate)
+    kv_cache.clear()
+
+metal_guard.start_kv_cache_monitor(
+    interval_secs=30,
+    headroom_gb=8.0,
+    growth_rate_warn_gb_per_min=2.0,
+    on_pressure=handle_pressure,
+)
+```
+
+### TurboQuant / Mixed-Precision Estimator Support
+
+`estimate_model_size_from_name()` now correctly handles TurboQuant (TQ3/TQ4) and Unsloth UD-MLX model naming conventions:
+
+| Pattern | Example | Estimate |
+|---------|---------|----------|
+| TQ4 | `gemma-4-31b-it-TQ4-MLX` | 15.5 GB |
+| TQ3 | `gemma-4-31b-it-TQ3-MLX` | 11.6 GB |
+| UD-MLX-4bit | `gemma-4-31b-it-UD-MLX-4bit` | 15.5 GB |
+
+Note: TQ models compress KV cache, allowing much longer contexts (50K-200K tokens). The estimator reports *model weight* footprint only — actual runtime memory depends on context length.
 
 ### Cross-Process Mutual Exclusion (Layer 8)
 
@@ -485,6 +538,20 @@ A module-level singleton `metal_guard` is provided.
 | `start_periodic_flush(interval_secs=300)` | Background timer to flush GPU cache |
 | `stop_periodic_flush()` | Stop periodic flush |
 | `start_watchdog(interval_secs, warn_pct, critical_pct, on_critical)` | Memory drift watchdog with escalating response |
+
+### Hardware Detection (v0.4.0)
+
+| Method | Description |
+|--------|-------------|
+| `detect_hardware() -> dict` *(static)* | Detect chip, memory, tier |
+| `recommended_config() -> dict` *(classmethod)* | Hardware-appropriate thresholds for all features |
+
+### KV Cache Monitor (v0.4.0)
+
+| Method | Description |
+|--------|-------------|
+| `start_kv_cache_monitor(interval_secs, headroom_gb, growth_rate_warn, on_pressure)` | Track KV cache growth rate, fire callback before OOM |
+| `stop_kv_cache_monitor()` | Stop the KV cache monitor |
 
 ### Forensics
 

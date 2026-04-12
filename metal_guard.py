@@ -79,7 +79,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Generator, TypeVar
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -93,15 +93,18 @@ T = TypeVar("T")
 if "AGX_RELAX_CDM_CTXSTORE_TIMEOUT" not in os.environ:
     os.environ["AGX_RELAX_CDM_CTXSTORE_TIMEOUT"] = "1"
 
-# Pattern to detect Metal OOM / GPU memory errors from the C++ runtime.
+# Pattern to detect Metal GPU errors from the C++ runtime.
 # Sources:
 #   - "Command buffer execution failed...Insufficient Memory" (mlx-lm#883, #1015)
 #   - "kIOGPUCommandBufferCallbackErrorOutOfMemory" (mlx-lm#854)
-#   - "fPendingMemorySet" (mlx#3346 @yoyaku155 — second panic signature)
+#   - "fPendingMemorySet" (mlx#3346 @yoyaku155 — IOGPUGroupMemory race)
+#   - "ImpactingInteractivity" (mlx#3267 @zackedds — GPU watchdog kills
+#     MLX when command buffers block WindowServer compositing on MacBook)
 _METAL_OOM_PATTERN = re.compile(
     r"Command buffer execution failed.*Insufficient Memory"
     r"|kIOGPUCommandBufferCallbackErrorOutOfMemory"
-    r"|fPendingMemorySet",
+    r"|fPendingMemorySet"
+    r"|ImpactingInteractivity",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -211,6 +214,151 @@ class MetalGuard:
         self._watchdog_critical_pct: float = 85.0
         self._watchdog_on_critical: Callable[[], None] | None = None
         self._watchdog_baseline: int | None = None
+        # KV cache monitor state (initialized by start_kv_cache_monitor)
+        self._kv_growth_rate_warn: float = 1.0
+        self._kv_headroom_gb: float = 4.0
+        self._kv_on_pressure: Callable[[float, float], None] | None = None
+        self._kv_samples: list[tuple[float, float]] = []
+        self._kv_interval: float = 30.0
+        self._kv_timer: threading.Timer | None = None
+
+    # ── Hardware-aware auto-configuration ────────────────────────────
+    # Addresses: community feedback that users with different hardware
+    # (8GB MBA to 512GB Mac Studio) need different safety thresholds.
+
+    @staticmethod
+    def detect_hardware() -> dict[str, Any]:
+        """Detect Apple Silicon hardware and return safety-relevant info.
+
+        Returns a dict with:
+          - gpu_memory_gb: Total GPU memory (unified memory on Apple Silicon)
+          - chip: Chip name (e.g. "Apple M1 Ultra")
+          - recommended_working_set_gb: Apple's recommended working set limit
+          - tier: "low" (8-16GB), "mid" (32-64GB), "high" (96-512GB)
+
+        Works without MLX installed (falls back to sysctl).
+        """
+        gpu_memory_gb = 0.0
+        chip = "unknown"
+        recommended_gb = 0.0
+
+        # Try MLX first (most accurate)
+        try:
+            import mlx.core as mx
+            info = mx.device_info()
+            recommended = info.get("max_recommended_working_set_size", 0)
+            recommended_gb = recommended / (1024 ** 3)
+            # Total memory ≈ recommended / 0.75 (Apple reserves ~25%)
+            gpu_memory_gb = recommended_gb / 0.75
+        except (ImportError, Exception):
+            pass
+
+        # Fallback: sysctl for total memory
+        if gpu_memory_gb == 0:
+            try:
+                import subprocess
+                result = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0:
+                    gpu_memory_gb = int(result.stdout.strip()) / (1024 ** 3)
+                    recommended_gb = gpu_memory_gb * 0.75
+            except Exception:
+                pass
+
+        # Detect chip name
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["sysctl", "-n", "machdep.cpu.brand_string"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                chip = result.stdout.strip()
+        except Exception:
+            pass
+
+        # Classify tier
+        if gpu_memory_gb <= 16:
+            tier = "low"
+        elif gpu_memory_gb <= 64:
+            tier = "mid"
+        else:
+            tier = "high"
+
+        return {
+            "gpu_memory_gb": round(gpu_memory_gb, 1),
+            "chip": chip,
+            "recommended_working_set_gb": round(recommended_gb, 1),
+            "tier": tier,
+        }
+
+    @classmethod
+    def recommended_config(cls) -> dict[str, Any]:
+        """Return hardware-appropriate configuration values.
+
+        Call this to get safe defaults for your machine, then pass them
+        to the relevant MetalGuard methods.
+
+        Returns a dict with recommended values for:
+          - watchdog_warn_pct / watchdog_critical_pct
+          - kv_headroom_gb / kv_growth_rate_warn
+          - cooldown_secs
+          - max_concurrent_models
+          - overhead_gb (for require_fit)
+
+        Example::
+
+            config = MetalGuard.recommended_config()
+            print(f"Your {config['chip']} ({config['gpu_memory_gb']}GB)")
+            print(f"Recommended watchdog: warn={config['watchdog_warn_pct']}%")
+
+            metal_guard.start_watchdog(
+                warn_pct=config["watchdog_warn_pct"],
+                critical_pct=config["watchdog_critical_pct"],
+            )
+            metal_guard.start_kv_cache_monitor(
+                headroom_gb=config["kv_headroom_gb"],
+            )
+        """
+        hw = cls.detect_hardware()
+        mem = hw["gpu_memory_gb"]
+        tier = hw["tier"]
+
+        if tier == "low":  # 8-16GB (MBA, base MBP)
+            config = {
+                "watchdog_warn_pct": 60.0,
+                "watchdog_critical_pct": 75.0,
+                "kv_headroom_gb": 2.0,
+                "kv_growth_rate_warn": 0.5,
+                "cooldown_secs": 3.0,
+                "max_concurrent_models": 1,
+                "overhead_gb": 3.0,
+            }
+        elif tier == "mid":  # 32-64GB (Mac Studio M1/M2/M4, MBP Max)
+            config = {
+                "watchdog_warn_pct": 67.0,
+                "watchdog_critical_pct": 82.0,
+                "kv_headroom_gb": 4.0,
+                "kv_growth_rate_warn": 1.0,
+                "cooldown_secs": 2.0,
+                "max_concurrent_models": 2,
+                "overhead_gb": 2.0,
+            }
+        else:  # 96-512GB (Ultra, Max Pro)
+            config = {
+                "watchdog_warn_pct": 70.0,
+                "watchdog_critical_pct": 85.0,
+                "kv_headroom_gb": 8.0,
+                "kv_growth_rate_warn": 2.0,
+                "cooldown_secs": 2.0,
+                "max_concurrent_models": 3,
+                "overhead_gb": 2.0,
+            }
+
+        config.update(hw)
+        return config
 
     # ── Thread tracking ──────────────────────────────────────────────
 
@@ -563,10 +711,16 @@ class MetalGuard:
           16bit / fp16 / bf16  → 2.0
           8bit / int8          → 1.0
           6bit                 → 0.75
-          4bit / int4 / q4 / mxfp4 → 0.5
-          3bit / int3          → 0.375
+          4bit / int4 / q4 / mxfp4 / TQ4 / UD-MLX-4bit → 0.5
+          3bit / int3 / TQ3    → 0.375
           2bit / int2          → 0.25
           (default when unspecified: 2.0, assumes fp16)
+
+        TurboQuant (TQ) models use quantized KV cache compression. The model
+        weights themselves follow the same per-parameter sizing, but TQ models
+        can sustain much longer context windows (50K-200K tokens) due to
+        compressed KV cache.  The estimator reports *model weight* footprint
+        only — actual runtime memory will be higher with long contexts.
 
         The result is a rough upper bound intended for pre-load gating —
         callers should not use it for precise accounting.
@@ -591,8 +745,8 @@ class MetalGuard:
             (r"16bit|fp16|bf16", 2.0),
             (r"8bit|int8", 1.0),
             (r"6bit", 0.75),
-            (r"4bit|int4|q4|mxfp4", 0.5),
-            (r"3bit|int3", 0.375),
+            (r"4bit|int4|(?<![a-z])q4|mxfp4|tq4|ud-mlx-4bit", 0.5),
+            (r"3bit|int3|tq3", 0.375),
             (r"2bit|int2", 0.25),
         ):
             if re.search(pat, name):
@@ -857,6 +1011,136 @@ class MetalGuard:
             log.debug("Watchdog error (non-fatal): %s", exc)
         finally:
             self._schedule_next_flush()
+
+    # ── KV cache memory monitor (v0.3.1) ────────────────────────────
+    # Addresses: mlx-lm#1047 (KV cache OOM on 512GB Mac Studio)
+    # KV cache grows unbounded during long conversations. Standard memory
+    # watchdog only sees total Metal active bytes, but KV cache growth
+    # rate is the leading indicator of imminent OOM. This monitor tracks
+    # the growth rate and fires a callback before the cache fills memory.
+
+    def start_kv_cache_monitor(
+        self,
+        interval_secs: float = 30.0,
+        growth_rate_warn_gb_per_min: float = 1.0,
+        headroom_gb: float = 4.0,
+        on_pressure: Callable[[float, float], None] | None = None,
+    ) -> None:
+        """Start a background monitor that tracks memory growth rate.
+
+        Designed for long-running servers (mlx_lm.server, OpenClaw) where
+        KV cache grows unbounded across conversations.  Detects rapid
+        memory growth *before* it hits OOM, giving the application time
+        to rotate caches or reject new requests.
+
+        Args:
+            interval_secs: How often to sample memory (default 30s).
+            growth_rate_warn_gb_per_min: Warn when memory is growing
+                faster than this rate (GB/min).  Default 1.0 GB/min.
+            headroom_gb: Trigger on_pressure when available memory drops
+                below this threshold.  Default 4.0 GB.
+            on_pressure: Callback(available_gb, growth_rate_gb_per_min)
+                called when headroom is low or growth rate is high.
+                Typical action: clear KV cache, reject new requests, or
+                restart the inference server gracefully.
+
+        Usage::
+
+            def handle_pressure(available_gb, growth_rate):
+                log.warning("KV cache pressure: %.1fGB free, growing %.1fGB/min",
+                            available_gb, growth_rate)
+                kv_cache.clear()
+
+            metal_guard.start_kv_cache_monitor(
+                interval_secs=30,
+                headroom_gb=8.0,
+                on_pressure=handle_pressure,
+            )
+        """
+        self._kv_growth_rate_warn = growth_rate_warn_gb_per_min
+        self._kv_headroom_gb = headroom_gb
+        self._kv_on_pressure = on_pressure
+        self._kv_samples: list[tuple[float, float]] = []  # (timestamp, active_gb)
+        self._kv_interval = interval_secs
+        self._kv_timer: threading.Timer | None = None
+        self._schedule_kv_tick()
+        log.info(
+            "KV cache monitor started (every %.0fs, warn_rate=%.1fGB/min, "
+            "headroom=%.1fGB)",
+            interval_secs, growth_rate_warn_gb_per_min, headroom_gb,
+        )
+
+    def stop_kv_cache_monitor(self) -> None:
+        """Stop the KV cache monitor."""
+        if self._kv_timer is not None:
+            self._kv_timer.cancel()
+            self._kv_timer = None
+            log.info("KV cache monitor stopped")
+
+    def _schedule_kv_tick(self) -> None:
+        self._kv_timer = threading.Timer(self._kv_interval, self._kv_tick)
+        self._kv_timer.daemon = True
+        self._kv_timer.start()
+
+    def _kv_tick(self) -> None:
+        try:
+            stats = self.memory_stats()
+            now = time.monotonic()
+            active_gb = stats.active_gb
+            available_gb = stats.available_gb
+
+            # Keep a sliding window of samples (last 5 minutes)
+            self._kv_samples.append((now, active_gb))
+            cutoff = now - 300  # 5-minute window
+            self._kv_samples = [
+                (t, v) for t, v in self._kv_samples if t >= cutoff
+            ]
+
+            # Calculate growth rate (GB/min) via linear slope
+            growth_rate = 0.0
+            if len(self._kv_samples) >= 2:
+                oldest_t, oldest_v = self._kv_samples[0]
+                elapsed_min = (now - oldest_t) / 60.0
+                if elapsed_min > 0.1:
+                    growth_rate = (active_gb - oldest_v) / elapsed_min
+
+            # Check conditions
+            pressure = False
+            if available_gb < self._kv_headroom_gb:
+                log.warning(
+                    "KV MONITOR: low headroom %.1fGB (threshold %.1fGB), "
+                    "growth_rate=%.2fGB/min",
+                    available_gb, self._kv_headroom_gb, growth_rate,
+                )
+                self.breadcrumb(
+                    f"KV_MONITOR: LOW_HEADROOM available={available_gb:.1f}GB "
+                    f"rate={growth_rate:.2f}GB/min"
+                )
+                pressure = True
+
+            if growth_rate > self._kv_growth_rate_warn:
+                log.warning(
+                    "KV MONITOR: rapid growth %.2fGB/min (threshold %.1f), "
+                    "available=%.1fGB",
+                    growth_rate, self._kv_growth_rate_warn, available_gb,
+                )
+                if not pressure:
+                    self.breadcrumb(
+                        f"KV_MONITOR: RAPID_GROWTH rate={growth_rate:.2f}GB/min "
+                        f"available={available_gb:.1f}GB"
+                    )
+                pressure = True
+
+            if pressure and self._kv_on_pressure:
+                try:
+                    self._kv_on_pressure(available_gb, growth_rate)
+                except Exception as exc:
+                    log.error("KV monitor on_pressure callback error: %s", exc)
+
+        except Exception as exc:
+            log.debug("KV monitor error (non-fatal): %s", exc)
+        finally:
+            self._schedule_kv_tick()
 
     # ── Pre-generate Metal health probe ─────────────────────────────
 

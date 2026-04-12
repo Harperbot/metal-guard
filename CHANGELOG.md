@@ -5,9 +5,42 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.3.1] — 2026-04-13
+## [0.4.0] — 2026-04-13
 
 ### Added
+
+- **Hardware-aware auto-configuration** — `detect_hardware()` identifies the
+  Apple Silicon chip, total GPU memory, and tier (low/mid/high).
+  `recommended_config()` returns safe defaults for watchdog thresholds,
+  KV cache headroom, cooldown, and max concurrent models — tuned per tier:
+  - **low** (8–16 GB, MBA/base MBP): conservative thresholds (warn 60%, critical 75%)
+  - **mid** (32–64 GB, Mac Studio/MBP Max): balanced (warn 67%, critical 82%)
+  - **high** (96–512 GB, Ultra/Max Pro): relaxed (warn 70%, critical 85%)
+
+  ```python
+  config = MetalGuard.recommended_config()
+  print(f"{config['chip']} ({config['gpu_memory_gb']}GB) → tier {config['tier']}")
+  metal_guard.start_watchdog(
+      warn_pct=config["watchdog_warn_pct"],
+      critical_pct=config["watchdog_critical_pct"],
+  )
+  ```
+
+- **KV cache growth monitor** — `start_kv_cache_monitor()` tracks memory
+  growth rate over a sliding 5-minute window. Fires `on_pressure` callback
+  when available headroom drops below threshold or growth rate exceeds a
+  limit (GB/min). Designed for long-running `mlx_lm.server` instances
+  where KV cache grows unbounded across conversations.
+  Addresses [mlx-lm#1047](https://github.com/ml-explore/mlx-lm/issues/1047)
+  (KV cache OOM crash on 512 GB Mac Studio).
+
+  ```python
+  metal_guard.start_kv_cache_monitor(
+      headroom_gb=8.0,
+      growth_rate_warn_gb_per_min=2.0,
+      on_pressure=lambda avail, rate: kv_cache.clear(),
+  )
+  ```
 
 - **Cross-process mutual exclusion (Layer 8)** — `acquire_mlx_lock()`,
   `release_mlx_lock()`, `read_mlx_lock()`, and `mlx_exclusive_lock()` context
@@ -19,13 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   New `MLXLockConflict` exception raised when a live process already holds
   the lock.
 
-  ```python
-  from metal_guard import mlx_exclusive_lock
-
-  with mlx_exclusive_lock("my_script"):
-      model, tokenizer = mlx_lm.load("mlx-community/gemma-4-31b-it-8bit")
-      result = mlx_lm.generate(model, tokenizer, prompt="Hello")
-  ```
+- **GPU watchdog detection** — `is_metal_oom()` now detects
+  `kIOGPUCommandBufferCallbackErrorImpactingInteractivity`, the macOS GPU
+  watchdog kill that terminates MLX training/inference when command buffers
+  block WindowServer display compositing on MacBook.
+  Addresses [mlx#3267](https://github.com/ml-explore/mlx/issues/3267).
 
 ## [0.3.0] — 2026-04-12
 

@@ -6,7 +6,7 @@
 
 防止因 Metal 驅動程式 bug 導致的 kernel panic 和 OOM crash——特別是多模型管線、長時間運行的伺服器，以及大量 tool calling 的 agent 框架。
 
-**目前版本：** v0.3.1 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
+**目前版本：** v0.4.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 問題是什麼
 
@@ -57,7 +57,60 @@ metal_guard.safe_cleanup()
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
 
-## v0.3.1 新功能
+## v0.4.0 新功能
+
+### 硬體感知自動配置
+
+不同的 Apple Silicon 機器需要不同的安全閾值。8GB MacBook Air 不能用跟 512GB Mac Studio 一樣的設定。MetalGuard 現在會偵測硬體並建議適當的數值。
+
+```python
+from metal_guard import MetalGuard
+
+config = MetalGuard.recommended_config()
+print(f"{config['chip']} ({config['gpu_memory_gb']}GB) → 等級: {config['tier']}")
+# Apple M1 Ultra (64.0GB) → 等級: mid
+
+# 直接使用建議值
+metal_guard.start_watchdog(
+    warn_pct=config["watchdog_warn_pct"],
+    critical_pct=config["watchdog_critical_pct"],
+)
+```
+
+| 等級 | 記憶體 | 警告 | 臨界 | 最大同時模型數 |
+|------|--------|------|------|--------------|
+| low | 8–16 GB | 60% | 75% | 1 |
+| mid | 32–64 GB | 67% | 82% | 2 |
+| high | 96–512 GB | 70% | 85% | 3 |
+
+### KV Cache 增長監控
+
+給長時間運行的伺服器用——KV cache 在多輪對話中無限增長。追蹤記憶體增長速率，在 OOM 前觸發 callback。對應 [mlx-lm#1047](https://github.com/ml-explore/mlx-lm/issues/1047)。
+
+```python
+def handle_pressure(available_gb, growth_rate):
+    log.warning("KV 壓力: %.1fGB 可用, 增長 %.1fGB/min", available_gb, growth_rate)
+    kv_cache.clear()
+
+metal_guard.start_kv_cache_monitor(
+    interval_secs=30,
+    headroom_gb=8.0,
+    growth_rate_warn_gb_per_min=2.0,
+    on_pressure=handle_pressure,
+)
+```
+
+### TurboQuant / 混合精度估算支援
+
+`estimate_model_size_from_name()` 現在正確處理 TurboQuant（TQ3/TQ4）和 Unsloth UD-MLX 模型命名：
+
+| 格式 | 範例 | 估算 |
+|------|------|------|
+| TQ4 | `gemma-4-31b-it-TQ4-MLX` | 15.5 GB |
+| TQ3 | `gemma-4-31b-it-TQ3-MLX` | 11.6 GB |
+| UD-MLX-4bit | `gemma-4-31b-it-UD-MLX-4bit` | 15.5 GB |
+
+注意：TQ 模型壓縮 KV cache，可以支撐更長的 context（50K-200K tokens）。估算器只報告*模型權重*佔用——實際運行記憶體取決於 context 長度。
 
 ### 跨 Process 互斥鎖（Layer 8）
 
@@ -403,6 +456,20 @@ async def chat(request):
 |------|------|
 | `start_periodic_flush(interval_secs=300)` | 背景定時清理 |
 | `start_watchdog(interval, warn_pct, critical_pct, on_critical)` | 記憶體漂移看門狗 |
+
+### 硬體偵測 (v0.4.0)
+
+| 方法 | 說明 |
+|------|------|
+| `detect_hardware() -> dict` *(靜態)* | 偵測晶片、記憶體、等級 |
+| `recommended_config() -> dict` *(類別方法)* | 針對硬體的建議閾值 |
+
+### KV Cache 監控 (v0.4.0)
+
+| 方法 | 說明 |
+|------|------|
+| `start_kv_cache_monitor(interval, headroom_gb, growth_rate_warn, on_pressure)` | 追蹤 KV cache 增長，OOM 前觸發 callback |
+| `stop_kv_cache_monitor()` | 停止 KV cache 監控 |
 
 ### 鑑識
 
