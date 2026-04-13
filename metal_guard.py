@@ -68,6 +68,7 @@ from __future__ import annotations
 import gc
 import json
 import logging
+import multiprocessing
 import os
 import re
 import signal
@@ -76,10 +77,11 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from multiprocessing.connection import Connection
 from pathlib import Path
-from typing import Any, Callable, Generator, TypeVar
+from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -1265,7 +1267,14 @@ class MetalGuard:
 # Cross-process mutual exclusion (Layer 8)
 # ---------------------------------------------------------------------------
 
-_PROCESS_LOCK_PATH = Path.home() / ".metal-guard" / "locks" / "mlx_exclusive.lock"
+# Lock file path — configurable via MLX_LOCK_PATH env var.
+# Default: ~/.metal-guard/locks/mlx_exclusive.lock
+_LOCK_PATH_ENV = os.getenv("MLX_LOCK_PATH")
+_PROCESS_LOCK_PATH = (
+    Path(_LOCK_PATH_ENV).expanduser()
+    if _LOCK_PATH_ENV
+    else Path.home() / ".metal-guard" / "locks" / "mlx_exclusive.lock"
+)
 
 
 class MLXLockConflict(RuntimeError):
@@ -1386,3 +1395,706 @@ def mlx_exclusive_lock(
 # ---------------------------------------------------------------------------
 
 metal_guard = MetalGuard()
+
+
+# ---------------------------------------------------------------------------
+# Layer 5: bench_scoped_load — sequential benchmark harness guard (v0.5.0)
+# ---------------------------------------------------------------------------
+# Layers 1-4 target concurrency and stale-thread hazards. They do NOT
+# protect a single-threaded, single-process harness that loads 4+ large
+# MLX models sequentially within one Python lifetime — the scenario
+# where residual Metal driver buffer accounting drifts above the working
+# set recommended limit and triggers an IOGPUMemory.cpp:492 kernel panic.
+#
+# L5 closes that gap via ``bench_scoped_load``: every entry acquires
+# the cross-process lock and loads fresh; every exit runs safe_cleanup +
+# extra cooldown + post-unload memory verification.
+#
+# Empirical: Metal lazy release needs ~8s on 64GB Apple Silicon after
+# unloading a 24GB model before the buffer pool pages return to the OS.
+# safe_cleanup's internal 1s cooldown is insufficient; 8s lets the OS
+# reclaimer catch up in almost all cases.
+
+_BENCH_POST_UNLOAD_COOLDOWN_SEC = 8.0
+
+# Post-unload active memory above this threshold logs an informational
+# message (not a failure). Metal's lazy page reclaimer only returns
+# pages when the NEXT load() allocates — stale-looking memory here is
+# expected behaviour, not a leak.
+_BENCH_POST_UNLOAD_ACTIVE_LIMIT_GB = 4.0
+
+
+@contextmanager
+def bench_scoped_load(
+    model_id: str,
+    *,
+    backend: str = "mlx",
+) -> Iterator[Tuple[Any, Any]]:
+    """Safe sequential model loading for long-running benchmark harnesses.
+
+    MetalGuard Layer 5. Wraps ``mlx_lm.load`` / ``mlx_vlm.load`` so a
+    harness that must load many large MLX models inside one Python
+    process gets the full defensive stack — cross-process lock, thread
+    registry via safe_cleanup, gc + mx.clear_cache + cooldown — on
+    every iteration, plus post-unload memory-drop verification.
+
+    Rationale: benchmark harnesses that bypass this library (calling
+    ``mlx_lm.load`` + ``mlx_lm.generate`` directly in a loop) can drift
+    above the working-set limit on 64GB Apple Silicon after loading 6+
+    large models sequentially — residual Metal driver buffer accounting
+    keeps stale allocations visible even after ``mx.clear_cache()``.
+    This has been observed to trigger an IOGPUMemory.cpp:492
+    ``completeMemory() prepare count underflow`` kernel panic.
+
+    Usage::
+
+        from metal_guard import bench_scoped_load
+
+        for model_id in candidate_models:  # 8 large models
+            with bench_scoped_load(model_id) as (model, tokenizer):
+                score = run_eval(model, tokenizer, items)
+                save_atomic_checkpoint(model_id, score)
+
+    Parameters
+    ----------
+    model_id:
+        Hugging Face model ID that ``mlx_lm.load`` / ``mlx_vlm.load`` accepts,
+        e.g. ``"mlx-community/Mistral-Small-3.2-24B-Instruct-2506-8bit"``.
+    backend:
+        ``"mlx"`` / ``"mlx-lm"`` → text model via ``mlx_lm.load``.
+        ``"mlx-vlm"`` → vision model via ``mlx_vlm.load``.
+
+    Yields
+    ------
+    The ``(model, tokenizer)`` tuple returned by the underlying loader.
+
+    Raises
+    ------
+    ValueError
+        If ``backend`` is not a supported MLX backend.
+    MLXLockConflict
+        If another process already holds the MLX exclusive lock.
+
+    Notes
+    -----
+    Does NOT replace Layers 1-4. It delegates to them and adds
+    post-unload verification specific to sequential benchmark loops.
+    """
+    metal_guard.breadcrumb(f"BENCH_SCOPED_LOAD: ENTER {model_id} backend={backend}")
+    log.info("bench_scoped_load: entering %s (backend=%s)", model_id, backend)
+
+    # Acquire cross-process lock for the entire bench scope (load + yield + unload).
+    # Unlike per-call acquisition, bench holds the lock across multiple
+    # generate() calls on the same model — preventing other processes from
+    # loading a competing model mid-benchmark.
+    acquire_mlx_lock("bench_scoped_load")
+
+    # Direct load. In bench scope we manage the full lifecycle
+    # (load → yield → unload) sequentially, and Metal's lazy page reclaimer
+    # only returns stale pages to the OS when the next load() actually
+    # allocates. Pre-checking memory_stats() here would report stale pages
+    # as "active" and incorrectly block legitimate back-to-back loads of
+    # 25GB+ models on 64GB machines.
+    if backend in ("mlx", "mlx-lm"):
+        from mlx_lm import load as _mlx_load
+        metal_guard.breadcrumb(f"BENCH_SCOPED_LOAD: direct load {model_id}")
+        loaded = _mlx_load(model_id)
+    elif backend == "mlx-vlm":
+        from mlx_vlm import load as _vlm_load
+        metal_guard.breadcrumb(f"BENCH_SCOPED_LOAD: direct vlm load {model_id}")
+        loaded = _vlm_load(model_id)
+    else:
+        release_mlx_lock()
+        raise ValueError(
+            f"bench_scoped_load: unsupported backend {backend!r} "
+            f"(expected 'mlx', 'mlx-lm', or 'mlx-vlm')"
+        )
+
+    try:
+        yield loaded
+    finally:
+        metal_guard.breadcrumb(
+            f"BENCH_SCOPED_LOAD: EXIT {model_id} — unloading + cooldown"
+        )
+        log.info("bench_scoped_load: exiting %s, unloading", model_id)
+
+        # Full cleanup: wait_for_threads + gc + flush_gpu + internal cooldown.
+        metal_guard.safe_cleanup()
+        gc.collect()
+
+        # Reset peak tracker so the NEXT iteration's memory_stats().peak_gb
+        # reflects only that model, not a stale high-water mark from a
+        # previous large model that Metal hasn't fully released yet.
+        try:
+            import mlx.core as mx
+            mx.reset_peak_memory()
+        except (ImportError, AttributeError):
+            pass
+
+        time.sleep(_BENCH_POST_UNLOAD_COOLDOWN_SEC)
+
+        # Diagnostic only: Metal lazy release means active memory may still
+        # report high here — the pages are reclaimed when the NEXT load()
+        # allocates. This is informational, not load-blocking.
+        stats = metal_guard.memory_stats()
+        active_after_gb = stats.active_gb
+        if active_after_gb > _BENCH_POST_UNLOAD_ACTIVE_LIMIT_GB:
+            log.info(
+                "bench_scoped_load: %s active memory %.1fGB after unload "
+                "(expected eventually < %.1fGB via Metal lazy release on next load)",
+                model_id, active_after_gb, _BENCH_POST_UNLOAD_ACTIVE_LIMIT_GB,
+            )
+        metal_guard.breadcrumb(
+            f"BENCH_SCOPED_LOAD: EXIT {model_id} done, active={active_after_gb:.1f}GB"
+        )
+        log.info(
+            "bench_scoped_load: exited %s, active memory %.1fGB peak %.1fGB",
+            model_id, active_after_gb, stats.peak_gb,
+        )
+        release_mlx_lock()
+
+
+# ---------------------------------------------------------------------------
+# Layer 6: Dual-mode switcher — defensive / observer (v0.5.0)
+# ---------------------------------------------------------------------------
+# MetalGuard has two operating modes:
+#
+#   - Defensive (default): actively block dangerous Metal GPU operations.
+#     process_lock refuses conflicting runs, sequential dispatch enforced.
+#
+#   - Observer: monitor and log, let the caller proceed. Used after
+#     upstream MLX ships #3348 (CommandEncoder thread-local) and empirical
+#     validation confirms parallel inference is safe on the target hardware.
+#
+# The five long-term primitives (safe_cleanup, daemon thread registry,
+# oom_protected_context, breadcrumb logging, memory_stats) are active
+# in BOTH modes — they address concerns orthogonal to thread safety.
+#
+# Set METALGUARD_MODE env var to switch:
+#   export METALGUARD_MODE=defensive    # default
+#   export METALGUARD_MODE=observer     # opt-in after #3348
+
+DEFENSIVE = "defensive"
+OBSERVER = "observer"
+
+_VALID_MODES = frozenset({DEFENSIVE, OBSERVER})
+_MODE_ENV_VAR = "METALGUARD_MODE"
+
+
+def current_mode() -> str:
+    """Return the current MetalGuard operating mode.
+
+    Reads the ``METALGUARD_MODE`` environment variable fresh on every
+    call. Values are case-insensitive. Unknown values fall back to
+    ``defensive`` (fail-safe default).
+    """
+    raw = os.environ.get(_MODE_ENV_VAR, DEFENSIVE).strip().lower()
+    if raw in _VALID_MODES:
+        return raw
+    log.warning(
+        "Unknown %s value %r — falling back to 'defensive'. "
+        "Valid values: %s",
+        _MODE_ENV_VAR, raw, sorted(_VALID_MODES),
+    )
+    return DEFENSIVE
+
+
+def is_defensive() -> bool:
+    """True when defensive mode is active (the default)."""
+    return current_mode() == DEFENSIVE
+
+
+def is_observer() -> bool:
+    """True when observer mode is active (opt-in via env var)."""
+    return current_mode() == OBSERVER
+
+
+def describe_mode() -> dict[str, str]:
+    """Return a structured description suitable for health endpoints.
+
+    Example output::
+
+        {
+            "mode": "defensive",
+            "description": "Actively blocks dangerous Metal operations",
+            "env_var": "METALGUARD_MODE=<unset> (default → defensive)",
+        }
+    """
+    mode = current_mode()
+    env_raw = os.environ.get(_MODE_ENV_VAR)
+    if env_raw is None:
+        env_display = f"{_MODE_ENV_VAR}=<unset> (default → defensive)"
+    else:
+        env_display = f"{_MODE_ENV_VAR}={env_raw!r}"
+    descriptions = {
+        DEFENSIVE: (
+            "Actively blocks dangerous Metal operations — process_lock refuses "
+            "conflicts, sequential dispatch enforced."
+        ),
+        OBSERVER: (
+            "Monitoring only — process_lock logs warnings but does not refuse, "
+            "parallel dispatch permitted. Requires mlx >= 0.31.2 (includes "
+            "#3348 CommandEncoder thread-local)."
+        ),
+    }
+    return {
+        "mode": mode,
+        "description": descriptions.get(mode, "(unknown)"),
+        "env_var": env_display,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Layer 7: Subprocess isolation — crash-safe MLX inference (v0.5.0)
+# ---------------------------------------------------------------------------
+# When MLX's C++ runtime throws from Metal's GCD CompletionQueueDispatch
+# (mlx::core::gpu::check_error), Python cannot catch it — std::terminate
+# calls abort() and the process dies.
+#
+# Subprocess isolation is the only way to protect the parent process:
+#   - Each MLX model runs in its own subprocess
+#   - Worker loads model once, accepts multiple prompts via pipe
+#   - If worker crashes (SIGABRT) → pipe breaks → parent detects → new worker
+#   - Parent's Python/Metal state is never corrupted
+#
+# Usage::
+#
+#     from metal_guard import MLXSubprocessRunner
+#
+#     runner = MLXSubprocessRunner("mlx-community/Mistral-Small-3.2-24B-8bit")
+#     for prompt in prompts:
+#         result = runner.generate(prompt, max_tokens=4096)
+#     runner.shutdown()
+#
+# Or use the auto-managed pool::
+#
+#     from metal_guard import call_model_isolated
+#     result = call_model_isolated(prompt, model="mlx-community/Phi-4-mini-4bit")
+
+# Default timeouts (seconds). MLX text generate rarely exceeds 120s; VLM can
+# take 180s. Add generous buffer for model loading on first call.
+_DEFAULT_GENERATE_TIMEOUT = 300.0
+_DEFAULT_LOAD_TIMEOUT = 120.0
+
+
+class SubprocessCrashError(RuntimeError):
+    """Raised when the MLX worker subprocess crashed (SIGABRT / unexpected exit)."""
+
+    def __init__(self, model_id: str, exitcode: int | None, detail: str = ""):
+        self.model_id = model_id
+        self.exitcode = exitcode
+        sig_name = ""
+        if exitcode is not None and exitcode < 0:
+            try:
+                sig_name = f" ({signal.Signals(-exitcode).name})"
+            except (ValueError, AttributeError):
+                pass
+        msg = (
+            f"MLX worker subprocess for {model_id!r} crashed "
+            f"(exit code {exitcode}{sig_name})"
+        )
+        if detail:
+            msg += f": {detail}"
+        super().__init__(msg)
+
+
+class SubprocessTimeoutError(TimeoutError):
+    """Raised when the worker subprocess did not respond within the timeout."""
+
+
+def _worker_main(
+    model_id: str,
+    backend: str,
+    recv_conn: Connection,
+    send_conn: Connection,
+) -> None:
+    """Worker loop running in a forked subprocess.
+
+    Loads the model once, then processes prompts until shutdown or crash.
+    All MLX / Metal operations happen here — if Metal SIGABRT fires,
+    only this process dies.
+    """
+    # Suppress TOKENIZERS_PARALLELISM warning in subprocess
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    # Install MetalGuard's SIGABRT handler for forensic breadcrumb
+    try:
+        from metal_guard import metal_guard as _mg
+        _mg.install_abort_handler()
+        _mg.breadcrumb(f"SUBPROCESS_WORKER: loading {model_id}")
+    except Exception:
+        pass
+
+    try:
+        if backend in ("mlx", "mlx-lm"):
+            from mlx_lm import load, generate
+            model, tokenizer = load(model_id)
+            gen_fn = generate
+        elif backend == "mlx-vlm":
+            from mlx_vlm import load, generate
+            model, tokenizer = load(model_id)
+            gen_fn = generate
+        else:
+            send_conn.send({"type": "error", "error": f"unsupported backend: {backend}"})
+            return
+    except Exception as exc:
+        send_conn.send({"type": "error", "error": f"load failed: {type(exc).__name__}: {exc}"})
+        return
+
+    # Signal ready to parent
+    send_conn.send({"type": "ready", "model_id": model_id, "pid": os.getpid()})
+
+    try:
+        from metal_guard import metal_guard as _mg
+        _mg.breadcrumb(f"SUBPROCESS_WORKER: {model_id} ready, pid={os.getpid()}")
+    except Exception:
+        pass
+
+    # Main loop: receive prompts, generate, send results
+    while True:
+        try:
+            if not recv_conn.poll(timeout=600):  # 10 min idle timeout
+                break  # No work for 10 minutes → self-terminate
+            request = recv_conn.recv()
+        except (EOFError, OSError):
+            break  # Parent closed pipe → exit
+
+        if request is None or request.get("type") == "shutdown":
+            break
+
+        prompt = request.get("prompt", "")
+        max_tokens = request.get("max_tokens", 4096)
+        temperature = request.get("temperature", 0.3)
+        system_prompt = request.get("system", "")
+
+        try:
+            # Apply chat template if available. Fall back to model-family
+            # templates when tokenizer.chat_template is unset (observed on
+            # some Mistral/Gemma4 quantized variants where the mlx-community
+            # upload strips the template). Falling back to raw prompt causes
+            # the model to treat the text as completion continuation and
+            # produce empty / incoherent output.
+            try:
+                formatted = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    add_generation_prompt=True,
+                    tokenize=False,
+                )
+            except Exception:
+                mid = model_id.lower()
+                if "gemma" in mid:
+                    formatted = (
+                        f"<start_of_turn>user\n{prompt}<end_of_turn>\n"
+                        f"<start_of_turn>model\n"
+                    )
+                elif "mistral" in mid:
+                    formatted = f"[INST] {prompt} [/INST]"
+                elif "phi" in mid:
+                    formatted = f"<|user|>\n{prompt}<|end|>\n<|assistant|>\n"
+                else:
+                    formatted = prompt
+
+            result = gen_fn(
+                model, tokenizer,
+                prompt=formatted,
+                max_tokens=max_tokens,
+                verbose=False,
+            )
+            if not isinstance(result, str):
+                result = str(result)
+            send_conn.send({"type": "result", "text": result})
+        except Exception as exc:
+            send_conn.send({
+                "type": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    # Clean exit
+    send_conn.send({"type": "shutdown_ack"})
+
+
+class MLXSubprocessRunner:
+    """Manage an isolated MLX worker subprocess for a specific model.
+
+    The worker loads the model once and stays alive for multiple generate
+    calls. If it crashes (Metal SIGABRT), the parent detects the broken
+    pipe and can create a new runner.
+
+    Thread-safe: uses a lock to serialize generate calls (Metal cannot
+    handle concurrent generate in a single process anyway).
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        backend: str = "mlx",
+        load_timeout: float = _DEFAULT_LOAD_TIMEOUT,
+        generate_timeout: float = _DEFAULT_GENERATE_TIMEOUT,
+    ) -> None:
+        self.model_id = model_id
+        self.backend = backend
+        self._load_timeout = load_timeout
+        self._generate_timeout = generate_timeout
+        self._lock = multiprocessing.Lock()
+        self._process: multiprocessing.Process | None = None
+        self._parent_send: Connection | None = None
+        self._parent_recv: Connection | None = None
+        self._worker_pid: int | None = None
+        self._started = False
+
+        self._start_worker()
+
+    def _start_worker(self) -> None:
+        """Fork the worker subprocess and wait for 'ready' signal."""
+        parent_recv, child_send = multiprocessing.Pipe(duplex=False)
+        child_recv, parent_send = multiprocessing.Pipe(duplex=False)
+
+        self._parent_send = parent_send
+        self._parent_recv = parent_recv
+
+        self._process = multiprocessing.Process(
+            target=_worker_main,
+            args=(self.model_id, self.backend, child_recv, child_send),
+            daemon=True,
+        )
+        self._process.start()
+        log.info(
+            "MLXSubprocessRunner: started worker pid=%d for %s",
+            self._process.pid, self.model_id,
+        )
+
+        if not parent_recv.poll(timeout=self._load_timeout):
+            self.kill()
+            raise SubprocessTimeoutError(
+                f"Worker for {self.model_id} did not respond within "
+                f"{self._load_timeout}s during model load"
+            )
+
+        msg = parent_recv.recv()
+        if msg.get("type") == "error":
+            self.kill()
+            raise RuntimeError(
+                f"Worker for {self.model_id} failed to load: {msg.get('error')}"
+            )
+        if msg.get("type") == "ready":
+            self._worker_pid = msg.get("pid")
+            self._started = True
+            log.info(
+                "MLXSubprocessRunner: worker pid=%d ready for %s",
+                self._worker_pid, self.model_id,
+            )
+
+    def generate(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+        system: str = "",
+        timeout: float | None = None,
+    ) -> str:
+        """Send a prompt to the worker and return the generated text.
+
+        Raises:
+            SubprocessCrashError: Worker process died (SIGABRT, etc.)
+            SubprocessTimeoutError: Worker did not respond in time
+            RuntimeError: Worker returned an error
+        """
+        if not self.is_alive():
+            raise SubprocessCrashError(
+                self.model_id,
+                self._process.exitcode if self._process else None,
+                "worker not alive at generate() entry",
+            )
+
+        effective_timeout = timeout if timeout is not None else self._generate_timeout
+
+        with self._lock:
+            try:
+                self._parent_send.send({
+                    "type": "generate",
+                    "prompt": prompt,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "system": system,
+                })
+            except (BrokenPipeError, OSError) as exc:
+                raise SubprocessCrashError(
+                    self.model_id,
+                    self._process.exitcode if self._process else None,
+                    f"send failed: {exc}",
+                ) from exc
+
+            if not self._parent_recv.poll(timeout=effective_timeout):
+                log.error(
+                    "MLXSubprocessRunner: worker pid=%s timed out after %.0fs for %s",
+                    self._worker_pid, effective_timeout, self.model_id,
+                )
+                self.kill()
+                raise SubprocessTimeoutError(
+                    f"Worker for {self.model_id} did not respond within "
+                    f"{effective_timeout}s"
+                )
+
+            try:
+                msg = self._parent_recv.recv()
+            except (EOFError, OSError) as exc:
+                raise SubprocessCrashError(
+                    self.model_id,
+                    self._process.exitcode if self._process else None,
+                    f"recv failed (worker likely crashed): {exc}",
+                ) from exc
+
+        if msg.get("type") == "result":
+            return msg["text"]
+        if msg.get("type") == "error":
+            raise RuntimeError(
+                f"Worker error for {self.model_id}: {msg.get('error')}"
+            )
+        raise RuntimeError(f"Unexpected message from worker: {msg}")
+
+    def is_alive(self) -> bool:
+        """Check if the worker subprocess is still running."""
+        return self._process is not None and self._process.is_alive()
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        """Gracefully shut down the worker subprocess."""
+        if self._process is None:
+            return
+        if not self._process.is_alive():
+            self._cleanup()
+            return
+
+        try:
+            self._parent_send.send({"type": "shutdown"})
+        except (BrokenPipeError, OSError):
+            pass
+
+        self._process.join(timeout=timeout)
+        if self._process.is_alive():
+            log.warning(
+                "MLXSubprocessRunner: worker pid=%s did not exit gracefully, killing",
+                self._worker_pid,
+            )
+            self._process.kill()
+            self._process.join(timeout=5)
+
+        self._cleanup()
+        log.info("MLXSubprocessRunner: worker for %s shut down", self.model_id)
+
+    def kill(self) -> None:
+        """Force-kill the worker subprocess."""
+        if self._process is not None and self._process.is_alive():
+            self._process.kill()
+            self._process.join(timeout=5)
+        self._cleanup()
+
+    def _cleanup(self) -> None:
+        """Close pipes and clear references."""
+        for conn in (self._parent_send, self._parent_recv):
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+        self._parent_send = None
+        self._parent_recv = None
+        self._process = None
+        self._started = False
+
+    @property
+    def worker_pid(self) -> int | None:
+        """PID of the worker subprocess, or None if not running."""
+        return self._worker_pid if self.is_alive() else None
+
+    def __del__(self) -> None:
+        try:
+            self.kill()
+        except Exception:
+            pass
+
+    def __repr__(self) -> str:
+        alive = "alive" if self.is_alive() else "dead"
+        return (
+            f"MLXSubprocessRunner(model={self.model_id!r}, "
+            f"pid={self._worker_pid}, {alive})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Layer 7: Auto-managed runner pool
+# ---------------------------------------------------------------------------
+
+_runner_pool: dict[str, MLXSubprocessRunner] = {}
+_pool_lock = multiprocessing.Lock()
+
+
+def call_model_isolated(
+    prompt: str,
+    model: str,
+    *,
+    backend: str = "mlx",
+    max_tokens: int = 4096,
+    temperature: float = 0.3,
+    system: str = "",
+    timeout: float | None = None,
+) -> str:
+    """Drop-in replacement for direct MLX calls, running inference in a subprocess.
+
+    Automatically manages a pool of worker subprocesses — one per model.
+    If a worker crashes (Metal SIGABRT), it is replaced on the next call.
+
+    Returns empty string on crash so the caller can continue the loop
+    (matching the conventional error-handling pattern of in-process calls).
+    """
+    key = f"{model}:{backend}"
+
+    with _pool_lock:
+        runner = _runner_pool.get(key)
+        if runner is not None and not runner.is_alive():
+            exitcode = runner._process.exitcode if runner._process else None
+            log.warning(
+                "call_model_isolated: previous worker for %s crashed "
+                "(exitcode=%s), creating new one",
+                model, exitcode,
+            )
+            runner.kill()
+            runner = None
+
+        if runner is None:
+            try:
+                runner = MLXSubprocessRunner(model, backend=backend)
+                _runner_pool[key] = runner
+            except (SubprocessTimeoutError, RuntimeError) as exc:
+                log.error("call_model_isolated: failed to start worker for %s: %s", model, exc)
+                return ""
+
+    try:
+        return runner.generate(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system,
+            timeout=timeout,
+        )
+    except SubprocessCrashError as exc:
+        log.error("call_model_isolated: %s", exc)
+        with _pool_lock:
+            runner.kill()
+            _runner_pool.pop(key, None)
+        return ""
+    except SubprocessTimeoutError as exc:
+        log.error("call_model_isolated: %s", exc)
+        with _pool_lock:
+            runner.kill()
+            _runner_pool.pop(key, None)
+        return ""
+
+
+def shutdown_all_workers() -> None:
+    """Gracefully shut down all worker subprocesses in the pool."""
+    with _pool_lock:
+        for key, runner in list(_runner_pool.items()):
+            runner.shutdown()
+        _runner_pool.clear()

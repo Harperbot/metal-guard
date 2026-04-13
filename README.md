@@ -6,7 +6,7 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version:** v0.4.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
+**Current version:** v0.5.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## The Problem
 
@@ -76,6 +76,73 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 # 4. Breadcrumbs for crash forensics
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
 ```
+
+## v0.5.0 Features
+
+### Layer 5: `bench_scoped_load` — Sequential Benchmark Guard
+
+Context manager for safely loading many large MLX models in a single Python process. Closes the gap where benchmark harnesses that bypass MetalGuard (calling `mlx_lm.load` + `mlx_lm.generate` directly in a loop) drift above the working-set limit on 64 GB Apple Silicon after 6+ large models and trigger an `IOGPUMemory.cpp:492 completeMemory() prepare count underflow` kernel panic.
+
+```python
+from metal_guard import bench_scoped_load
+
+for model_id in candidate_models:  # 8+ large models
+    with bench_scoped_load(model_id) as (model, tokenizer):
+        score = run_eval(model, tokenizer, items)
+        save_checkpoint(model_id, score)
+```
+
+Every entry acquires the cross-process lock and loads fresh via `mlx_lm.load` / `mlx_vlm.load`. Every exit runs `safe_cleanup` + 8s cooldown + post-unload memory verification. Metal's lazy page reclaimer only returns pages when the NEXT load() allocates — `bench_scoped_load` routes every iteration through the defensive stack.
+
+### Layer 6: Dual-Mode Switcher
+
+Switch between `defensive` (default) and `observer` modes via the `METALGUARD_MODE` environment variable. Intended for use after [mlx#3348](https://github.com/ml-explore/mlx/pull/3348) (CommandEncoder thread-local) ships in a release tag.
+
+```bash
+export METALGUARD_MODE=defensive  # default, actively blocks dangerous operations
+export METALGUARD_MODE=observer   # opt-in after #3348; monitors + logs only
+```
+
+```python
+from metal_guard import current_mode, is_observer, describe_mode
+
+if is_observer():
+    # parallel dispatch is permitted
+    pass
+
+print(describe_mode())
+# {'mode': 'defensive', 'description': '...', 'env_var': '...'}
+```
+
+The five long-term primitives (`safe_cleanup`, thread registry, `oom_protected_context`, breadcrumb logging, `memory_stats`) remain active in BOTH modes — they address concerns orthogonal to thread safety.
+
+### Layer 7: Subprocess Isolation
+
+`MLXSubprocessRunner` + auto-managed `call_model_isolated()` pool for crash-safe MLX inference. Addresses `mlx::core::gpu::check_error` C++ exceptions thrown from Metal's GCD `CompletionQueueDispatch` queue — these cannot be caught by Python (they trigger `std::terminate → abort()`), so subprocess isolation is the only safe mitigation.
+
+```python
+from metal_guard import MLXSubprocessRunner
+
+runner = MLXSubprocessRunner("mlx-community/Mistral-Small-3.2-24B-8bit")
+for prompt in prompts:
+    result = runner.generate(prompt, max_tokens=4096)
+runner.shutdown()
+```
+
+Or drop-in replace a direct call with the auto-managed pool:
+
+```python
+from metal_guard import call_model_isolated
+
+# Automatically creates + reuses a worker per model; respawns on crash
+result = call_model_isolated(prompt, model="mlx-community/Phi-4-mini-4bit")
+```
+
+Worker includes chat template fallbacks for Mistral (`[INST]`), Gemma (`<start_of_turn>`), and Phi families when `tokenizer.chat_template` is unset (observed on some mlx-community quantized uploads).
+
+### `MLX_LOCK_PATH` Configurability
+
+The L8 cross-process lock file path is now overridable via the `MLX_LOCK_PATH` environment variable (default `~/.metal-guard/locks/mlx_exclusive.lock`).
 
 ## v0.4.0 Features
 

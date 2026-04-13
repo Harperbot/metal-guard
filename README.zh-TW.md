@@ -6,7 +6,7 @@
 
 防止因 Metal 驅動程式 bug 導致的 kernel panic 和 OOM crash——特別是多模型管線、長時間運行的伺服器，以及大量 tool calling 的 agent 框架。
 
-**目前版本：** v0.4.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
+**目前版本：** v0.5.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 問題是什麼
 
@@ -56,6 +56,73 @@ metal_guard.safe_cleanup()
 # 3. 載入前檢查記憶體
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
+
+## v0.5.0 新功能
+
+### Layer 5：`bench_scoped_load` — 序列化 benchmark 防護
+
+Context manager，用於在單一 Python process 內安全載入多個大型 MLX 模型。關閉 benchmark harness 繞過 MetalGuard（直接 for loop 呼叫 `mlx_lm.load` + `mlx_lm.generate`）在 64 GB Apple Silicon 載入 6+ 大模型後 working-set 漂移超限、觸發 `IOGPUMemory.cpp:492 completeMemory() prepare count underflow` kernel panic 的漏洞。
+
+```python
+from metal_guard import bench_scoped_load
+
+for model_id in candidate_models:  # 8+ 大模型
+    with bench_scoped_load(model_id) as (model, tokenizer):
+        score = run_eval(model, tokenizer, items)
+        save_checkpoint(model_id, score)
+```
+
+每次進入 context：取得 cross-process lock、透過 `mlx_lm.load` / `mlx_vlm.load` 直接載入。每次離開：`safe_cleanup` + 8 秒冷卻 + post-unload 記憶體驗證。Metal 的 lazy page reclaimer 只在**下一次 load() 分配**時才歸還 stale pages —— `bench_scoped_load` 讓每個迭代都走完整防護棧。
+
+### Layer 6：Dual-Mode 切換器
+
+透過 `METALGUARD_MODE` 環境變數在 `defensive`（預設）和 `observer` 模式之間切換。為 [mlx#3348](https://github.com/ml-explore/mlx/pull/3348)（CommandEncoder thread-local）發佈後預先準備。
+
+```bash
+export METALGUARD_MODE=defensive  # 預設，主動阻擋危險操作
+export METALGUARD_MODE=observer   # #3348 release 後 opt-in；僅監控 + 記錄
+```
+
+```python
+from metal_guard import current_mode, is_observer, describe_mode
+
+if is_observer():
+    # 允許 parallel dispatch
+    pass
+
+print(describe_mode())
+# {'mode': 'defensive', 'description': '...', 'env_var': '...'}
+```
+
+五個長期 active primitives（`safe_cleanup`、thread registry、`oom_protected_context`、breadcrumb logging、`memory_stats`）在**兩種模式都保持啟用** —— 它們處理的是跟 thread safety 正交的問題。
+
+### Layer 7：Subprocess 隔離
+
+`MLXSubprocessRunner` + 自動管理的 `call_model_isolated()` pool，提供 crash-safe MLX 推論。處理從 Metal GCD `CompletionQueueDispatch` queue 丟出的 `mlx::core::gpu::check_error` C++ exceptions —— Python 無法 catch（直接觸發 `std::terminate → abort()`），所以 subprocess 隔離是唯一安全的緩解方式。
+
+```python
+from metal_guard import MLXSubprocessRunner
+
+runner = MLXSubprocessRunner("mlx-community/Mistral-Small-3.2-24B-8bit")
+for prompt in prompts:
+    result = runner.generate(prompt, max_tokens=4096)
+runner.shutdown()
+```
+
+或用 drop-in 替代直接呼叫的自動管理 pool：
+
+```python
+from metal_guard import call_model_isolated
+
+# 自動建立 + 重用每個模型的 worker；crash 時自動 respawn
+result = call_model_isolated(prompt, model="mlx-community/Phi-4-mini-4bit")
+```
+
+Worker 針對 Mistral（`[INST]`）、Gemma（`<start_of_turn>`）、Phi 系列內建 chat template fallback，處理 `tokenizer.chat_template` 未設定的情況（某些 mlx-community 量化版會 strip 掉 template）。
+
+### `MLX_LOCK_PATH` 可配置化
+
+L8 cross-process lock 檔案路徑現在可透過 `MLX_LOCK_PATH` 環境變數覆蓋（預設 `~/.metal-guard/locks/mlx_exclusive.lock`）。
 
 ## v0.4.0 新功能
 

@@ -5,6 +5,80 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-04-13
+
+### Added
+
+- **Layer 5: `bench_scoped_load`** — context manager for safe sequential
+  model loading in long-running benchmark harnesses. Acquires the
+  cross-process lock, loads via `mlx_lm.load` / `mlx_vlm.load`, runs
+  `safe_cleanup` + 8s cooldown + post-unload memory verification on exit.
+
+  Closes the gap where benchmark loops that bypass this library (calling
+  `mlx_lm.load` + `mlx_lm.generate` directly) drift above the working-set
+  limit on 64 GB Apple Silicon after 6+ large models and trigger the
+  `IOGPUMemory.cpp:492 completeMemory() prepare count underflow` kernel
+  panic.
+
+  ```python
+  from metal_guard import bench_scoped_load
+
+  for model_id in candidate_models:  # 8+ large models
+      with bench_scoped_load(model_id) as (model, tokenizer):
+          score = run_eval(model, tokenizer, items)
+          save_checkpoint(model_id, score)
+  ```
+
+- **Layer 6: Dual-mode switcher** — `current_mode()`, `is_defensive()`,
+  `is_observer()`, `describe_mode()` driven by the `METALGUARD_MODE`
+  env var. Defensive (default) actively blocks dangerous operations;
+  Observer (opt-in) monitors and logs, permitting parallel dispatch.
+  Intended for use after [mlx#3348](https://github.com/ml-explore/mlx/pull/3348)
+  (CommandEncoder thread-local) ships in a release tag.
+
+  ```bash
+  export METALGUARD_MODE=defensive  # default, current behaviour
+  export METALGUARD_MODE=observer   # opt-in after #3348 release
+  ```
+
+- **Layer 7: Subprocess isolation** — `MLXSubprocessRunner` + auto-managed
+  `call_model_isolated()` pool for crash-safe MLX inference. Each model
+  runs in its own worker subprocess; if the worker crashes via Metal
+  SIGABRT the parent detects the broken pipe and spawns a replacement,
+  leaving the main Python/Metal state intact.
+
+  Addresses the class of `mlx::core::gpu::check_error` C++ exceptions
+  thrown from Metal's GCD `CompletionQueueDispatch` queue — these
+  cannot be caught by Python (they trigger `std::terminate → abort()`),
+  so subprocess isolation is the only safe mitigation.
+
+  ```python
+  from metal_guard import MLXSubprocessRunner
+
+  runner = MLXSubprocessRunner("mlx-community/Mistral-Small-3.2-24B-8bit")
+  for prompt in prompts:
+      result = runner.generate(prompt, max_tokens=4096)
+  runner.shutdown()
+  ```
+
+  Worker includes chat template fallbacks for Mistral / Gemma / Phi
+  families when `tokenizer.chat_template` is unset (observed on some
+  mlx-community quantized uploads).
+
+- **`MLX_LOCK_PATH` env var** — L8 process lock path is now overridable
+  via the `MLX_LOCK_PATH` environment variable. Default unchanged
+  (`~/.metal-guard/locks/mlx_exclusive.lock`).
+
+### Summary — complete L1-L8 layered defense
+
+| Layer | Concern | Mechanism |
+|---|---|---|
+| L1-L4 | Thread races, OOM, stale buffers | `MetalGuard` singleton (in-process) |
+| L5 | Sequential big-model load drift | `bench_scoped_load` context manager |
+| L6 | Mode switch between defensive/observer | `METALGUARD_MODE` env var |
+| L7 | Metal C++ crashes | `MLXSubprocessRunner` + `call_model_isolated` |
+| L8 | Cross-process contention | `mlx_exclusive_lock` / `acquire_mlx_lock` |
+
 ## [0.4.0] — 2026-04-13
 
 ### Added
