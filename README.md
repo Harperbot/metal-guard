@@ -6,7 +6,7 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version:** v0.5.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
+**Current version:** v0.6.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## The Problem
 
@@ -76,6 +76,71 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 # 4. Breadcrumbs for crash forensics
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
 ```
+
+## v0.6.0 Features
+
+### Hardened `acquire_mlx_lock(force=True)` — incident-driven
+
+Before v0.6.0, `force=True` unconditionally overwrote the lock file and left the previous holder running. In production that regularly left two MLX processes loading into the same GPU — the exact kernel-panic path (`IOGPUMemory.cpp:492 completeMemory() prepare count underflow` reachable in seconds). v0.6.0 hardens the reclaim:
+
+```python
+from metal_guard import acquire_mlx_lock, release_mlx_lock, MLXLockConflict
+
+try:
+    acquire_mlx_lock("rescuer", force=True)
+    # → SIGTERM the holder, poll up to MLX_FORCE_WAIT_SEC (default 30s)
+    #   for exit (zombie-aware), then sleep MLX_RECLAIM_COOLDOWN_SEC
+    #   (default 8s) to let Metal buffer GC finish.
+except MLXLockConflict as e:
+    if e.holder.get("force_timeout"):
+        print("Peer refuses to exit — lock deliberately left intact.")
+    elif e.holder.get("force_permission_denied"):
+        print("SIGTERM denied (e.g. different user) — cannot guarantee buffer release.")
+    # In both cases the lock file is NOT removed — that is the anti-panic invariant.
+finally:
+    release_mlx_lock()
+```
+
+- **Zombie-aware liveness**: `_is_pid_alive` parses `ps -p <pid> -o state=` and treats `Z` (zombie) as dead — zombies have already released Metal buffers, otherwise the FORCE wait loop would livelock until the parent reaper caught up.
+- **New env vars**: `MLX_FORCE_WAIT_SEC` (default 30), `MLX_RECLAIM_COOLDOWN_SEC` (default 8). Set to 0 in tests / tight CI.
+- **Typed failure fields** on `MLXLockConflict.holder`: `force_timeout` and `force_permission_denied` so callers can branch without parsing error strings.
+
+**Upgrade note**: callers that relied on the old "always succeeds" semantics must now catch `MLXLockConflict`. This is intentional — the old behaviour was the kernel-panic path.
+
+### Version Advisory System
+
+`check_version_advisories()` returns a list of active advisories for the `(mlx, mlx-lm, mlx-vlm)` versions installed in the current environment, mapped to upstream issue numbers + severity. Purely informational; intended for dashboards and startup logs.
+
+```python
+from metal_guard import check_version_advisories
+
+for a in check_version_advisories():
+    print(f"[{a['severity']}] {a['package']} {a['installed_version']} — {a['title']}")
+    print(f"    {a['url']}")
+```
+
+Initial coverage targets mlx-lm 0.31.2 regressions and the #3348 gate:
+
+| Issue | Affected | Severity | Symptom |
+|-------|----------|----------|---------|
+| [mlx-lm#1128](https://github.com/ml-explore/mlx-lm/issues/1128) | mlx-lm `==0.31.2` | high | `TokenizerWrapper.think_start_id` `len(None)` crash |
+| [mlx-lm#1139](https://github.com/ml-explore/mlx-lm/issues/1139) | mlx-lm `==0.31.2` | high | Broadcast errors after second voting round |
+| [mlx-lm#1081](https://github.com/ml-explore/mlx-lm/issues/1081) | mlx-lm `==0.31.2` | medium | `ArraysCache.is_trimmable()` but `trim()` missing (speculative decoding only) |
+| [mlx#3348](https://github.com/ml-explore/mlx/pull/3348) | mlx `<0.31.2` | info | CommandEncoder thread-local fix merged 2026-04-01, not yet in a PyPI release — observer-mode gate still blocked |
+
+### Upstream Defensive Patches
+
+`install_upstream_defensive_patches()` installs narrow, version-gated, idempotent monkey-patches for known upstream bugs. Each patch logs a WARNING when applied and auto-skips when the installed package version is outside the affected range — once upstream ships a fix, this call becomes a no-op without any caller change.
+
+```python
+from metal_guard import install_upstream_defensive_patches
+
+status = install_upstream_defensive_patches()
+# → {'mlx_lm_1128_think_start_id': True}   if mlx-lm 0.31.2 is installed
+# → {'mlx_lm_1128_think_start_id': False}  on other versions (nothing to patch)
+```
+
+Inaugural patch: **`mlx_lm_1128_think_start_id`** replaces `TokenizerWrapper.think_start_id` with an accessor that returns `None` when `_think_start_tokens is None` instead of raising `TypeError`. Scoped to mlx-lm `==0.31.2`.
 
 ## v0.5.0 Features
 
@@ -549,14 +614,21 @@ MetalGuard(cooldown_secs=2.0, thread_timeout_secs=30.0, breadcrumb_path="logs/me
 
 A module-level singleton `metal_guard` is provided.
 
-### Cross-Process Lock (v0.3.1)
+### Cross-Process Lock (v0.3.1, hardened in v0.6.0)
 
 | Method | Description |
 |--------|-------------|
-| `acquire_mlx_lock(label, force=False)` | Acquire exclusive cross-process lock. Raises `MLXLockConflict` if held |
+| `acquire_mlx_lock(label, force=False)` | Acquire exclusive cross-process lock. Raises `MLXLockConflict` if held. `force=True` **since v0.6.0**: SIGTERMs the holder, waits up to `MLX_FORCE_WAIT_SEC`, sleeps `MLX_RECLAIM_COOLDOWN_SEC` post-reclaim; raises `MLXLockConflict(force_timeout=True)` if the holder refuses to exit (never unlinks while peer is alive) |
 | `release_mlx_lock() -> bool` | Release lock if this process holds it |
-| `read_mlx_lock() -> dict \| None` | Inspect lock without blocking. Self-heals stale locks |
+| `read_mlx_lock() -> dict \| None` | Inspect lock without blocking. Self-heals stale + zombie locks |
 | `mlx_exclusive_lock(label)` | Context manager: acquire on enter, release on exit |
+
+### Version Advisories + Upstream Patches (v0.6.0)
+
+| Method | Description |
+|--------|-------------|
+| `check_version_advisories(packages=None) -> list[dict]` | Active advisories for installed `(mlx, mlx-lm, mlx-vlm)` versions. Pass `packages={name: version}` to bypass `importlib.metadata` lookup (tests) |
+| `install_upstream_defensive_patches(force=False) -> dict[str, bool]` | Opt-in, version-gated, idempotent monkey-patches. Returns `{patch_name: was_applied}`. `force=True` bypasses the version gate (tests only) |
 
 ### Thread Tracking
 
@@ -679,6 +751,10 @@ Issues that MetalGuard addresses:
 | [mlx-lm#1047](https://github.com/ml-explore/mlx-lm/issues/1047) | KV cache OOM on large model | `can_fit()` + `ensure_headroom()` |
 | [mlx-examples#1124](https://github.com/ml-explore/mlx-examples/issues/1124) | Server memory leak → reboot | `periodic_flush` + `watchdog` |
 | [mlx#2133](https://github.com/ml-explore/mlx/issues/2133) | Thread safety ongoing | `register_thread()` + `wait_for_threads()` |
+| [mlx-lm#1128](https://github.com/ml-explore/mlx-lm/issues/1128) | `TokenizerWrapper.think_start_id` `len(None)` crash on mlx-lm 0.31.2 | `install_upstream_defensive_patches()` |
+| [mlx-lm#1139](https://github.com/ml-explore/mlx-lm/issues/1139) | mlx-lm 0.31.2 broadcast-error regression | `check_version_advisories()` — warning only, downgrade to 0.31.1 |
+| [mlx-lm#1081](https://github.com/ml-explore/mlx-lm/issues/1081) | `ArraysCache.is_trimmable()` but `trim()` missing | `check_version_advisories()` — callers guard with `hasattr(c, 'trim')` |
+| [mlx#3348](https://github.com/ml-explore/mlx/pull/3348) | CommandEncoder thread-local (merged 2026-04-01, not yet in PyPI) | `check_version_advisories()` tracks observer-mode gate |
 
 ## License
 

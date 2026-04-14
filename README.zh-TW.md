@@ -6,7 +6,7 @@
 
 防止因 Metal 驅動程式 bug 導致的 kernel panic 和 OOM crash——特別是多模型管線、長時間運行的伺服器，以及大量 tool calling 的 agent 框架。
 
-**目前版本：** v0.5.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
+**目前版本：** v0.6.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 問題是什麼
 
@@ -56,6 +56,71 @@ metal_guard.safe_cleanup()
 # 3. 載入前檢查記憶體
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
+
+## v0.6.0 新功能
+
+### `acquire_mlx_lock(force=True)` 強化 — incident-driven
+
+v0.6.0 之前，`force=True` 會**無條件覆蓋** lock file，讓前一個持有者繼續跑。在實務上這常造成兩個 MLX process 同時把模型載入同一顆 GPU — 這就是 kernel panic 路徑（`IOGPUMemory.cpp:492 completeMemory() prepare count underflow`，幾秒內就會炸）。v0.6.0 把 FORCE 重寫成「真正搶鎖」：
+
+```python
+from metal_guard import acquire_mlx_lock, release_mlx_lock, MLXLockConflict
+
+try:
+    acquire_mlx_lock("rescuer", force=True)
+    # → SIGTERM 舊持有者 → 輪詢最多 MLX_FORCE_WAIT_SEC（預設 30 秒）
+    #   確認退出（zombie-aware）→ 休眠 MLX_RECLAIM_COOLDOWN_SEC
+    #   （預設 8 秒）讓 Metal buffer GC 完成。
+except MLXLockConflict as e:
+    if e.holder.get("force_timeout"):
+        print("Peer 拒絕退出 — lock 刻意保留不 unlink。")
+    elif e.holder.get("force_permission_denied"):
+        print("SIGTERM 被拒（例如不同 user）— 無法保證 buffer 已釋放。")
+    # 兩種情況都**不會 unlink** lock file — 這是反 panic 不變式。
+finally:
+    release_mlx_lock()
+```
+
+- **Zombie-aware liveness**：`_is_pid_alive` 會 parse `ps -p <pid> -o state=`，把 `Z`（zombie）視為死亡 — zombie 已釋放 Metal buffer，否則 FORCE wait loop 會等到 parent reaper 才解開。
+- **新 env vars**：`MLX_FORCE_WAIT_SEC`（預設 30）、`MLX_RECLAIM_COOLDOWN_SEC`（預設 8）。測試 / tight CI 可設為 0。
+- **`MLXLockConflict.holder` 新 typed fields**：`force_timeout` 和 `force_permission_denied`，caller 不用解析錯誤字串就能分辨失敗模式。
+
+**升級注意**：以前倚賴「`force=True` 一定成功」的 caller 現在必須 catch `MLXLockConflict`。這是刻意為之 — 舊行為就是 kernel panic 路徑。
+
+### 版本 Advisory 系統
+
+`check_version_advisories()` 回傳當前環境已安裝的 `(mlx, mlx-lm, mlx-vlm)` 版本對應的 active advisories，映射到 upstream issue 編號與 severity。純資訊性，用於 dashboard 和啟動 log。
+
+```python
+from metal_guard import check_version_advisories
+
+for a in check_version_advisories():
+    print(f"[{a['severity']}] {a['package']} {a['installed_version']} — {a['title']}")
+    print(f"    {a['url']}")
+```
+
+初始覆蓋範圍聚焦在 mlx-lm 0.31.2 regressions 與 #3348 gate：
+
+| Issue | 影響版本 | Severity | 症狀 |
+|-------|---------|----------|------|
+| [mlx-lm#1128](https://github.com/ml-explore/mlx-lm/issues/1128) | mlx-lm `==0.31.2` | high | `TokenizerWrapper.think_start_id` `len(None)` crash |
+| [mlx-lm#1139](https://github.com/ml-explore/mlx-lm/issues/1139) | mlx-lm `==0.31.2` | high | 第二輪投票後 broadcast error |
+| [mlx-lm#1081](https://github.com/ml-explore/mlx-lm/issues/1081) | mlx-lm `==0.31.2` | medium | `ArraysCache.is_trimmable()` 但沒有 `trim()`（只影響 speculative decoding） |
+| [mlx#3348](https://github.com/ml-explore/mlx/pull/3348) | mlx `<0.31.2` | info | CommandEncoder thread-local 已於 2026-04-01 merged，但還沒 ship 到 PyPI — observer mode 切換 gate 仍 blocked |
+
+### Upstream Defensive Patches
+
+`install_upstream_defensive_patches()` 安裝精確範圍、version-gated、冪等的 monkey-patch 修補已知 upstream bug。每個 patch 套用時會 log WARNING，並在偵測到已安裝版本不在 affected 範圍時自動 skip — 上游一旦 ship fix，這個呼叫就自動變 no-op，caller 不用改 code。
+
+```python
+from metal_guard import install_upstream_defensive_patches
+
+status = install_upstream_defensive_patches()
+# → {'mlx_lm_1128_think_start_id': True}   若裝的是 mlx-lm 0.31.2
+# → {'mlx_lm_1128_think_start_id': False}  其他版本（沒東西要 patch）
+```
+
+首款 patch：**`mlx_lm_1128_think_start_id`** 將 `TokenizerWrapper.think_start_id` 換成一個安全 accessor，在 `_think_start_tokens is None` 時回傳 `None` 而不是 raise `TypeError`。僅套用於 mlx-lm `==0.31.2`。
 
 ## v0.5.0 新功能
 
