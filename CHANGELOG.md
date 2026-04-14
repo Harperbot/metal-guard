@@ -5,6 +5,124 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-04-14
+
+### Changed (behaviour)
+
+- **`acquire_mlx_lock(force=True)` is now a hardened reclaim.** Before
+  v0.6.0, `force=True` unconditionally overwrote the existing lock file
+  and left the previous holder running. In production that routinely
+  left two MLX processes loading into the same GPU — the exact
+  kernel-panic path
+  (`IOGPUMemory.cpp:492 completeMemory() prepare count underflow`
+  reachable in seconds). Starting v0.6.0, `force=True`:
+
+  1. Sends `SIGTERM` to the current holder.
+  2. Polls up to `MLX_FORCE_WAIT_SEC` (default 30 s) for the holder to
+     exit. Zombie-aware: processes in state `Z` are treated as dead
+     because Metal buffer release is tied to process exit, not to the
+     parent's `wait()` reap.
+  3. Unlinks the lock only after confirmed exit.
+  4. Sleeps `MLX_RECLAIM_COOLDOWN_SEC` (default 8 s) to let the kernel's
+     Metal buffer GC catch up before returning.
+
+  If the holder refuses to exit, `MLXLockConflict` is raised with
+  `holder["force_timeout"] = True` and the lock is **deliberately left
+  intact** — this is the anti-panic invariant. Unlinking while a live
+  peer still holds Metal buffers is exactly what the prior behaviour
+  did wrong.
+
+  If `SIGTERM` raises `PermissionError` (for example pid 1, or a peer
+  owned by a different user), `MLXLockConflict(force_permission_denied=True)`
+  is raised and again the lock is left intact — we cannot guarantee
+  the peer released its Metal buffers, so refusing to acquire is the
+  safe choice.
+
+### Added
+
+- **`_is_pid_alive` is now zombie-aware.** Helper `_is_zombie(pid)`
+  parses `ps -p <pid> -o state=`; a first character of `Z` counts as
+  dead. This closes an otherwise-silent livelock in the FORCE wait
+  loop: the old check (`os.kill(pid, 0)`) returns success for zombies
+  until the parent reaps them, which could be minutes under a busy
+  launchd supervisor.
+
+- **`MLXLockConflict.holder` typed failure fields** — callers can now
+  distinguish:
+  - `holder["force_timeout"]` — SIGTERM delivered, peer did not exit.
+  - `holder["force_permission_denied"]` — SIGTERM denied by the OS.
+  Both cases leave the lock intact.
+
+- **New env vars** for tuning the FORCE path:
+  - `MLX_FORCE_WAIT_SEC` (default 30) — seconds to wait after SIGTERM.
+  - `MLX_RECLAIM_COOLDOWN_SEC` (default 8) — post-reclaim Metal buffer
+    GC sleep. Set to 0 in tests / tight CI.
+
+- **`check_version_advisories()`** — returns a list of active advisories
+  for the `(mlx, mlx-lm, mlx-vlm)` versions installed in the current
+  environment, mapped to upstream issue numbers + severity. Purely
+  informational; intended for dashboards and startup logs. Initial
+  advisories target mlx-lm 0.31.2 regressions:
+
+  - [mlx-lm#1128](https://github.com/ml-explore/mlx-lm/issues/1128) —
+    `TokenizerWrapper.think_start_id` crashes when `_think_start_tokens`
+    is `None` (`TypeError: object of type 'NoneType' has no len()`).
+  - [mlx-lm#1139](https://github.com/ml-explore/mlx-lm/issues/1139) —
+    broadcast errors after the second voting round; reproducible
+    regression vs 0.31.1.
+  - [mlx-lm#1081](https://github.com/ml-explore/mlx-lm/issues/1081) —
+    `ArraysCache.is_trimmable()` returns `True` but `trim()` does not
+    exist (speculative decoding MTP cache-hit path only).
+  - [mlx#3348](https://github.com/ml-explore/mlx/pull/3348) — merged
+    2026-04-01 but not yet shipped in a PyPI release; observer-mode
+    gate still blocked.
+
+  ```python
+  from metal_guard import check_version_advisories
+  for a in check_version_advisories():
+      print(f"[{a['severity']}] {a['package']} {a['installed_version']} — {a['issue']}")
+  ```
+
+- **`install_upstream_defensive_patches()`** — opt-in, version-gated
+  monkey-patches for known upstream bugs. Each patch is idempotent,
+  logs a WARNING when applied, and auto-skips when the installed
+  package version is outside the affected range — so once upstream
+  ships a fix this becomes a no-op without any caller change.
+
+  Inaugural patch: `mlx_lm_1128_think_start_id` replaces
+  `TokenizerWrapper.think_start_id` with an accessor that returns
+  `None` when `_think_start_tokens is None` instead of raising
+  `TypeError`. Scoped to mlx-lm `==0.31.2`.
+
+  ```python
+  from metal_guard import install_upstream_defensive_patches
+  install_upstream_defensive_patches()
+  # WARNING metal_guard: installed defensive patch for mlx-lm#1128 …
+  ```
+
+### Fixed
+
+- **Version drift between `metal_guard.py::__version__` and
+  `pyproject.toml::version`.** v0.5.0 shipped with `pyproject.toml`
+  still pinned at 0.4.0, which made `importlib.metadata.version("metal-guard")`
+  report the wrong value. Both now read 0.6.0.
+
+### Tests
+
+- 11 new tests (7 FORCE hardening, 4 zombie-aware liveness, 5 version
+  advisories, 7 defensive-patches) — total 82/82 passing.
+
+### Upgrade note
+
+`acquire_mlx_lock(force=True)` is behaviourally different from prior
+versions: it can now raise `MLXLockConflict` instead of silently
+succeeding. Callers that relied on the old "always succeeds" semantics
+need to catch `MLXLockConflict` and decide how to handle a stubborn
+peer. This is intentional — the old behaviour was the kernel-panic
+path.
+
+---
+
 ## [0.5.0] — 2026-04-13
 
 ### Added

@@ -81,7 +81,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -1276,9 +1276,41 @@ _PROCESS_LOCK_PATH = (
     else Path.home() / ".metal-guard" / "locks" / "mlx_exclusive.lock"
 )
 
+# How long to wait for the previous lock holder to exit after receiving
+# SIGTERM during a ``force=True`` acquire. A well-behaved MLX process
+# takes a few seconds to flush Metal buffers and run atexit hooks.
+# Anything beyond this is hung or actively ignoring SIGTERM, in which
+# case we abort rather than silently unlink — unlinking while the peer
+# still holds Metal buffers is the kernel-panic path (see FORCE hardening
+# notes in CHANGELOG v0.6.0). Tunable via env var for tests / tight CI.
+_FORCE_WAIT_SEC = float(os.getenv("MLX_FORCE_WAIT_SEC", "30"))
+_FORCE_POLL_INTERVAL_SEC = 0.25
+
+# After a FORCE acquire has SIGTERM'd the previous holder and confirmed
+# it exited, sleep this long before returning — gives the kernel's Metal
+# buffer GC a window to release the peer's VRAM allocations before the
+# new process starts loading models into the same GPU. Without this gap
+# the new model load can race the buffer GC and still recreate the panic
+# conditions. Only applies when we actually reclaimed from a live peer;
+# normal (lock-free) acquires stay zero-latency. Set to 0 in tests.
+_RECLAIM_COOLDOWN_SEC = float(os.getenv("MLX_RECLAIM_COOLDOWN_SEC", "8"))
+
 
 class MLXLockConflict(RuntimeError):
-    """Raised when another live process already holds the MLX lock."""
+    """Raised when another live process already holds the MLX lock.
+
+    The exception message includes the holder's label, pid, timestamp,
+    and cmdline so operators can decide whether to wait or intervene.
+    The holder info is exposed via ``.holder`` as a dict.
+
+    When raised from the ``force=True`` path, ``.holder`` may include:
+      * ``force_timeout=True`` — SIGTERM was delivered but the peer did
+        not exit within ``MLX_FORCE_WAIT_SEC``. Lock deliberately left
+        intact so that Metal buffers are not double-allocated.
+      * ``force_permission_denied=True`` — we lack permission to signal
+        the peer (e.g. pid 1, different user). Lock deliberately left
+        intact. Caller should escalate manually rather than retry.
+    """
 
     def __init__(self, holder: dict[str, Any]):
         self.holder = holder
@@ -1290,11 +1322,23 @@ class MLXLockConflict(RuntimeError):
             f"MLX lock held by {label} (pid={pid}, since {started}). "
             f"cmdline: {cmdline!r}. "
             f"Concurrent MLX workloads trigger Metal kernel panics — "
-            f"wait for the other process to finish, or pass force=True."
+            f"wait for the other process to finish, or pass force=True "
+            f"if you know the other process is hung."
         )
 
 
 def _is_pid_alive(pid: int) -> bool:
+    """True if ``pid`` is a running, non-zombie process.
+
+    A process that has called ``exit()`` but has not yet been reaped by
+    its parent shows up as a zombie in ``ps``. ``os.kill(pid, 0)``
+    succeeds for zombies, but they have already released every kernel
+    resource including Metal buffers. For the purposes of the
+    kernel-panic invariant ("is it safe to take this MLX lock?"),
+    zombies must be treated as dead — otherwise FORCE override would
+    block forever waiting for a peer whose Metal buffers are already
+    freed.
+    """
     if pid <= 0:
         return False
     try:
@@ -1302,14 +1346,116 @@ def _is_pid_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
+        # Process exists but owned by another user. We cannot inspect
+        # its state, so conservatively say alive.
         return True
+    if _is_zombie(pid):
+        return False
     return True
+
+
+def _is_zombie(pid: int) -> bool:
+    """Return True if ``ps`` reports the pid is a zombie (state 'Z').
+
+    macOS and Linux both expose this via ``ps -p <pid> -o state=``; the
+    first character is the process state, 'Z' for zombies. Falls back
+    to False on exotic platforms without ``ps`` — the conservative
+    choice, preserving pre-v0.6.0 behaviour.
+    """
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "state="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except (FileNotFoundError, OSError):
+        return False
+    except Exception as exc:  # noqa: BLE001 — diagnostic fallback
+        log.debug("_is_zombie: ps failed for pid %d: %s", pid, exc)
+        return False
+    state = out.stdout.strip()
+    return bool(state) and state[0].upper() == "Z"
+
+
+def _force_terminate_and_wait(existing: dict[str, Any]) -> None:
+    """SIGTERM the previous lock holder and wait for it to exit.
+
+    Raises ``MLXLockConflict`` when the holder does not exit within
+    ``_FORCE_WAIT_SEC`` or when we lack permission to signal it. The
+    caller only unlinks the lock after this returns cleanly —
+    unlinking while the holder is still alive is the kernel-panic
+    path (Metal buffers double-allocated across two live MLX
+    processes → ``IOGPUMemory.cpp:492`` underflow).
+    """
+    existing_pid = existing.get("pid")
+    if not isinstance(existing_pid, int) or existing_pid <= 0:
+        log.warning(
+            "_force_terminate_and_wait: invalid pid %r in lock, "
+            "unlinking anyway", existing_pid,
+        )
+        return
+
+    log.warning(
+        "acquire_mlx_lock: FORCE requested, sending SIGTERM to %s "
+        "(pid %s) and waiting up to %.1fs for Metal buffer release",
+        existing.get("label", "?"), existing_pid, _FORCE_WAIT_SEC,
+    )
+    try:
+        os.kill(existing_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        # Already dead — nothing to wait for, safe to unlink.
+        log.info(
+            "_force_terminate_and_wait: pid %d already exited before SIGTERM",
+            existing_pid,
+        )
+        return
+    except PermissionError as exc:
+        # Process exists but we cannot signal it. We must not unlink
+        # because we cannot guarantee the peer released Metal buffers.
+        raise MLXLockConflict({
+            **existing,
+            "force_permission_denied": True,
+            "message": (
+                f"FORCE override cannot signal pid {existing_pid}: {exc}. "
+                f"Peer's MLX buffer state is unknown — refusing to unlink "
+                f"the lock to avoid a kernel panic. Stop the peer "
+                f"manually, or run with elevated privileges if you are "
+                f"certain it is safe to kill."
+            ),
+        }) from exc
+
+    deadline = time.monotonic() + _FORCE_WAIT_SEC
+    while time.monotonic() < deadline:
+        if not _is_pid_alive(existing_pid):
+            log.info(
+                "_force_terminate_and_wait: pid %d exited after SIGTERM",
+                existing_pid,
+            )
+            return
+        time.sleep(_FORCE_POLL_INTERVAL_SEC)
+
+    raise MLXLockConflict({
+        **existing,
+        "force_timeout": True,
+        "message": (
+            f"FORCE override sent SIGTERM to pid {existing_pid} but it "
+            f"did not exit within {_FORCE_WAIT_SEC:.1f}s. MLX buffers "
+            f"are still allocated on the GPU — aborting to avoid a "
+            f"kernel panic. Kill pid {existing_pid} manually (SIGKILL) "
+            f"and retry."
+        ),
+    })
 
 
 def read_mlx_lock() -> dict[str, Any] | None:
     """Return the current lock holder's info dict, or None if free.
 
-    Self-healing: if the recorded pid is dead, the stale lock is removed.
+    Self-healing: if the recorded pid is dead (including zombies that
+    have released their Metal buffers), the stale lock is removed and
+    None is returned.
     """
     if not _PROCESS_LOCK_PATH.exists():
         return None
@@ -1332,15 +1478,49 @@ def read_mlx_lock() -> dict[str, Any] | None:
 def acquire_mlx_lock(label: str, *, force: bool = False) -> dict[str, Any]:
     """Acquire the cross-process MLX exclusive lock.
 
-    Raises MLXLockConflict when another live process holds the lock
-    and force=False.
+    Raises ``MLXLockConflict`` when another live process holds the lock
+    and ``force=False``.
+
+    When ``force=True`` (v0.6.0 hardened semantics): sends ``SIGTERM``
+    to the current holder, polls up to ``MLX_FORCE_WAIT_SEC`` seconds
+    for it to exit, then reclaims the lock. Raises ``MLXLockConflict``
+    with ``holder["force_timeout"]=True`` if the peer does not exit,
+    or ``holder["force_permission_denied"]=True`` if the SIGTERM was
+    denied. **Never unlinks while the holder is still alive** — that
+    is the documented kernel-panic path. After a successful reclaim
+    from a live peer, sleeps ``MLX_RECLAIM_COOLDOWN_SEC`` to allow
+    Metal buffer GC to finish before returning.
+
+    Args:
+        label: short identifier for the caller (e.g. ``"bench_harness"``,
+            ``"long_running_job"``). Shown to any other process that
+            attempts to acquire while you hold it.
+        force: if True, terminate the existing holder (see above).
+            Use only when you have independently verified that killing
+            the other holder is safe.
+
+    Returns:
+        The info dict written to the lock file.
+
+    Raises:
+        MLXLockConflict: see above for the three failure modes.
     """
     _PROCESS_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    force_reclaimed = False
 
     if not force:
         holder = read_mlx_lock()
         if holder is not None and holder.get("pid") != os.getpid():
             raise MLXLockConflict(holder)
+    else:
+        existing = read_mlx_lock()
+        force_reclaimed = (
+            existing is not None and existing.get("pid") != os.getpid()
+        )
+        if force_reclaimed:
+            _force_terminate_and_wait(existing)
+            _PROCESS_LOCK_PATH.unlink(missing_ok=True)
 
     info: dict[str, Any] = {
         "pid": os.getpid(),
@@ -1355,6 +1535,16 @@ def acquire_mlx_lock(label: str, *, force: bool = False) -> dict[str, Any]:
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
+
+    # Post-reclaim cooldown — let the kernel's Metal buffer GC catch up
+    # before the caller starts loading new models into the same GPU.
+    if force_reclaimed and _RECLAIM_COOLDOWN_SEC > 0:
+        log.info(
+            "acquire_mlx_lock: post-reclaim cooldown %.1fs (Metal buffer GC)",
+            _RECLAIM_COOLDOWN_SEC,
+        )
+        time.sleep(_RECLAIM_COOLDOWN_SEC)
+
     return info
 
 
@@ -1377,6 +1567,9 @@ def mlx_exclusive_lock(
 ) -> Generator[dict[str, Any], None, None]:
     """Context manager: acquire on enter, always release on exit.
 
+    See ``acquire_mlx_lock`` for ``force=True`` hardened semantics
+    (SIGTERM-and-wait, never silent unlink).
+
     Example::
 
         with mlx_exclusive_lock("my_script"):
@@ -1395,6 +1588,257 @@ def mlx_exclusive_lock(
 # ---------------------------------------------------------------------------
 
 metal_guard = MetalGuard()
+
+
+# ---------------------------------------------------------------------------
+# Version advisory system (v0.6.0)
+# ---------------------------------------------------------------------------
+# Static database of known-bad (mlx, mlx-lm, mlx-vlm) version combos
+# mapped to upstream issue numbers + severity. Use
+# ``check_version_advisories()`` to get the active advisories for the
+# packages installed in the current environment.
+#
+# Maintenance policy:
+#   * Only list issues that are OPEN upstream, or CLOSED but not yet
+#     fixed in a shipped release. Remove entries once the fix reaches
+#     a PyPI release.
+#   * Severity: "critical" — crash / kernel panic / data loss
+#                "high"    — feature broken, workaround exists
+#                "medium"  — warning noise, correctness preserved
+#                "info"    — observability note
+#   * Keep entries short; link to the upstream issue for detail.
+# ---------------------------------------------------------------------------
+
+# Each entry is (package, version_spec, advisory_dict).
+# version_spec is a string compared with ``packaging.specifiers.SpecifierSet``;
+# e.g. "==0.31.2" matches only that exact version, ">=0.31.2,<0.32"
+# matches that range.
+_VERSION_ADVISORIES: list[tuple[str, str, dict[str, Any]]] = [
+    (
+        "mlx-lm",
+        "==0.31.2",
+        {
+            "issue": "ml-explore/mlx-lm#1128",
+            "severity": "high",
+            "title": "TokenizerWrapper.think_start_id crashes when _think_start_tokens is None",
+            "url": "https://github.com/ml-explore/mlx-lm/issues/1128",
+            "symptom": "TypeError: object of type 'NoneType' has no len()",
+            "mitigation": (
+                "Call ``install_upstream_defensive_patches()`` to install "
+                "a safe accessor, or downgrade to mlx-lm 0.31.1."
+            ),
+        },
+    ),
+    (
+        "mlx-lm",
+        "==0.31.2",
+        {
+            "issue": "ml-explore/mlx-lm#1139",
+            "severity": "high",
+            "title": "0.31.2 regression: broadcast errors under multi-agent voting",
+            "url": "https://github.com/ml-explore/mlx-lm/issues/1139",
+            "symptom": "broadcast error after second voting round in 0.31.2 (not 0.31.1)",
+            "mitigation": "Downgrade to mlx-lm 0.31.1 until upstream fix ships.",
+        },
+    ),
+    (
+        "mlx-lm",
+        "==0.31.2",
+        {
+            "issue": "ml-explore/mlx-lm#1081",
+            "severity": "medium",
+            "title": "ArraysCache.is_trimmable() returns True but trim() method missing",
+            "url": "https://github.com/ml-explore/mlx-lm/issues/1081",
+            "symptom": (
+                "AttributeError on speculative-decoding MTP perfect cache hits"
+            ),
+            "mitigation": (
+                "Affects speculative-decoding callers only. Guard with "
+                "``hasattr(cache, 'trim')`` before invoking."
+            ),
+        },
+    ),
+    (
+        "mlx",
+        "<0.31.2",
+        {
+            "issue": "ml-explore/mlx#3348",
+            "severity": "info",
+            "title": "CommandEncoder thread-local fix merged 2026-04-01 but not in this release",
+            "url": "https://github.com/ml-explore/mlx/pull/3348",
+            "symptom": (
+                "Concurrent MLX dispatches across threads still risk the "
+                "IOGPUFamily kernel panic on Apple Silicon."
+            ),
+            "mitigation": (
+                "Keep METALGUARD_MODE defensive (default). Observer mode "
+                "is only safe once mlx ships a release containing #3348."
+            ),
+        },
+    ),
+]
+
+
+def _installed_version(package: str) -> str | None:
+    """Return the installed version of ``package`` or None if not installed."""
+    try:
+        import importlib.metadata as metadata
+    except ImportError:  # pragma: no cover — Python ≥ 3.8 has this
+        return None
+    try:
+        return metadata.version(package)
+    except metadata.PackageNotFoundError:
+        return None
+    except Exception as exc:  # noqa: BLE001 — diagnostic fallback
+        log.debug("_installed_version(%s) failed: %s", package, exc)
+        return None
+
+
+def _spec_matches(version: str, spec: str) -> bool:
+    """Return True if ``version`` satisfies ``spec`` (PEP 440 specifier)."""
+    try:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version, InvalidVersion
+    except ImportError:
+        # packaging is a pip/setuptools transitive dep — nearly universal —
+        # but fall back to exact string match if it is missing.
+        return version == spec.lstrip("=")
+    try:
+        return Version(version) in SpecifierSet(spec)
+    except (InvalidVersion, ValueError):
+        return False
+
+
+def check_version_advisories(
+    *, packages: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return active advisories for the packages installed in this env.
+
+    Args:
+        packages: optional override map of ``{package_name: version}``
+            to bypass ``importlib.metadata`` lookup. Useful in tests.
+
+    Returns:
+        List of advisory dicts. Each dict has keys ``package``,
+        ``installed_version``, ``issue``, ``severity``, ``title``,
+        ``url``, ``symptom``, ``mitigation``. Empty list if no known
+        issues apply to the current environment.
+
+    Example::
+
+        for a in check_version_advisories():
+            print(f"[{a['severity']}] {a['package']} {a['installed_version']} — {a['title']}")
+            print(f"    {a['url']}")
+    """
+    resolved = packages or {}
+    active: list[dict[str, Any]] = []
+    for pkg, spec, advisory in _VERSION_ADVISORIES:
+        installed = resolved.get(pkg) if packages is not None else _installed_version(pkg)
+        if installed is None:
+            continue
+        if not _spec_matches(installed, spec):
+            continue
+        entry = dict(advisory)
+        entry["package"] = pkg
+        entry["installed_version"] = installed
+        entry["affected_spec"] = spec
+        active.append(entry)
+    return active
+
+
+# ---------------------------------------------------------------------------
+# Upstream defensive patches (v0.6.0)
+# ---------------------------------------------------------------------------
+# Narrow, version-gated monkey-patches that install safe shims for known
+# mlx-lm bugs without modifying upstream code. Opt-in only — callers
+# invoke ``install_upstream_defensive_patches()`` explicitly at program
+# start. Each patch is idempotent (tagged on first install, skipped on
+# subsequent calls) and auto-skips when the installed package version
+# is outside the affected range, so once upstream ships a fix this
+# becomes a no-op without any caller change.
+# ---------------------------------------------------------------------------
+
+
+def install_upstream_defensive_patches(*, force: bool = False) -> dict[str, bool]:
+    """Install safe accessors for known upstream bugs.
+
+    Each patch is version-gated against the installed package version
+    and skipped when upstream has shipped a fix. Idempotent — safe to
+    call multiple times. Emits a WARNING log for each patch applied so
+    operators can confirm what was installed.
+
+    Args:
+        force: bypass the installed-version check. Tests only.
+
+    Returns:
+        Dict of ``{patch_name: was_applied}``. ``False`` means the patch
+        was skipped (already applied, package missing, version outside
+        affected range, or upstream already fixed).
+
+    Example::
+
+        from metal_guard import install_upstream_defensive_patches
+        status = install_upstream_defensive_patches()
+        # {'mlx_lm_1128_think_start_id': True}
+    """
+    return {
+        "mlx_lm_1128_think_start_id": _patch_mlx_lm_1128(force=force),
+    }
+
+
+def _patch_mlx_lm_1128(*, force: bool) -> bool:
+    """Apply defensive shim for ml-explore/mlx-lm#1128.
+
+    ``TokenizerWrapper.think_start_id`` calls ``len(self._think_start_tokens)``
+    but ``_infer_thinking()`` can leave that attribute as ``None``, which
+    raises ``TypeError`` rather than signalling no think tokens. We
+    replace the property with one that returns ``None`` in that case.
+    """
+    mlx_lm_version = _installed_version("mlx-lm")
+    if mlx_lm_version is None:
+        return False
+    if not force and not _spec_matches(mlx_lm_version, "==0.31.2"):
+        return False
+
+    # Resolve via sys.modules so test fixtures that inject a fake
+    # ``mlx_lm.tokenizer_utils`` can intercept. A naive
+    # ``from mlx_lm import tokenizer_utils`` reads the attribute off
+    # the already-imported parent package and bypasses sys.modules.
+    _tu = sys.modules.get("mlx_lm.tokenizer_utils")
+    if _tu is None:
+        try:
+            import importlib
+            _tu = importlib.import_module("mlx_lm.tokenizer_utils")
+        except ImportError:
+            return False
+
+    TW = getattr(_tu, "TokenizerWrapper", None)
+    if TW is None:
+        return False
+
+    existing = getattr(TW, "think_start_id", None)
+    if not isinstance(existing, property):
+        return False
+    if getattr(existing.fget, "_metal_guard_safe", False):
+        return False  # idempotent
+
+    def safe_think_start_id(self):  # type: ignore[no-untyped-def]
+        tokens = getattr(self, "_think_start_tokens", None)
+        if tokens is None:
+            return None
+        if len(tokens) > 1:
+            raise ValueError(
+                "multiple think start tokens in TokenizerWrapper — ambiguous"
+            )
+        return tokens[0] if tokens else None
+
+    safe_think_start_id._metal_guard_safe = True  # type: ignore[attr-defined]
+    TW.think_start_id = property(safe_think_start_id)
+    log.warning(
+        "metal_guard: installed defensive patch for mlx-lm#1128 "
+        "(think_start_id None-safety) on mlx-lm %s", mlx_lm_version,
+    )
+    return True
 
 
 # ---------------------------------------------------------------------------
