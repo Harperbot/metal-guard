@@ -8,6 +8,32 @@ Prevents kernel panics and OOM crashes caused by Metal driver bugs when running 
 
 **Current version:** v0.7.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
+## Landed here searching for one of these? You're in the right place.
+
+If your Mac is panicking / rebooting / crashing while running MLX and you
+searched for any of the strings below, metal-guard is designed for you:
+
+- `IOGPUMemory.cpp:492 completeMemory() prepare count underflow`
+- `IOGPUMemory.cpp:550` kernel panic on Apple Silicon under MLX
+- `kIOGPUCommandBufferCallbackErrorOutOfMemory`
+- `mlx::core::gpu::check_error` → `std::terminate` → `abort` (SIGABRT)
+- `mlx::core::metal::GPUMemoryAllocator` / `fPendingMemorySet`
+- `mlx_lm.generate` crashes mid-inference, parent Python process dies
+- `mlx_lm.server` OOM kernel panic / Mac reboot under sustained load
+- `mlx_vlm` TurboQuant decode T=1 silent corruption (`mlx-vlm#967`)
+- `com.apple.iokit.IOGPUFamily` (104.x / 129.x) referenced in a panic report
+- `AGX_RELAX_CDM_CTXSTORE_TIMEOUT` mentioned by a maintainer
+- Gemma 4 / Mistral-Small / Pixtral / Llama 4-bit produces garbage output
+- M1 / M2 / M3 / M4 (Max / Ultra / Pro) Mac Studio / MacBook Pro kernel panic
+- Long-context (≥ 65 k) prefill in MLX triggers reboot
+- `transformers` 5.0 / 5.5 import errors from `mlx_vlm.load`
+
+Related upstream tracking issues: `ml-explore/mlx#3186` / `#3346` / `#3390` /
+`#3348`, `ml-explore/mlx-lm#883` / `#854` / `#1047` / `#1015`,
+`Blaizzy/mlx-vlm#967` / `#943` / `#1011` / `#1016`. metal-guard watches
+these via `check_version_advisories()` and warns at startup if the
+versions installed in the environment are affected.
+
 ## The Problem
 
 Apple's Metal GPU driver on Apple Silicon has a bug: when GPU memory management fails, **the kernel panics the entire machine** instead of gracefully killing the process.

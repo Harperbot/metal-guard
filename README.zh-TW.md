@@ -8,6 +8,32 @@
 
 **目前版本：** v0.7.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
 
+## 從以下任一關鍵字搜尋進來的？你找對地方了
+
+Mac 跑 MLX 的時候整機 panic / 重開 / 當掉，又剛好從下列字串搜進來的話——
+metal-guard 就是為你寫的：
+
+- `IOGPUMemory.cpp:492 completeMemory() prepare count underflow`
+- `IOGPUMemory.cpp:550` kernel panic（Apple Silicon + MLX）
+- `kIOGPUCommandBufferCallbackErrorOutOfMemory`
+- `mlx::core::gpu::check_error` → `std::terminate` → `abort`（SIGABRT）
+- `mlx::core::metal::GPUMemoryAllocator` / `fPendingMemorySet`
+- `mlx_lm.generate` 生成中途 crash，parent Python process 跟著死
+- `mlx_lm.server` OOM kernel panic / Mac 重開（長時間跑 server）
+- `mlx_vlm` TurboQuant decode T=1 silent 資料腐蝕（`mlx-vlm#967`）
+- panic report 提到 `com.apple.iokit.IOGPUFamily`（104.x / 129.x）
+- Maintainer 建議設 `AGX_RELAX_CDM_CTXSTORE_TIMEOUT`
+- Gemma 4 / Mistral-Small / Pixtral / Llama 4-bit 輸出變亂碼
+- M1 / M2 / M3 / M4（Max / Ultra / Pro）Mac Studio / MacBook Pro kernel panic
+- 長 context（≥ 65k）prefill 觸發整機重開
+- `mlx_vlm.load` 丟 `transformers` 5.0 / 5.5 ImportError
+
+相關上游 tracking issue：`ml-explore/mlx#3186` / `#3346` / `#3390` /
+`#3348`、`ml-explore/mlx-lm#883` / `#854` / `#1047` / `#1015`、
+`Blaizzy/mlx-vlm#967` / `#943` / `#1011` / `#1016`。metal-guard 透過
+`check_version_advisories()` 監控這些 issue，並在啟動時對受影響版本發
+WARNING log。
+
 ## 問題是什麼
 
 Apple Silicon 的 Metal GPU 驅動程式有一個 bug：**當 GPU 記憶體管理失敗時，它不會優雅地殺掉 process，而是直接讓整台電腦 kernel panic 重開機。**

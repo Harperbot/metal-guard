@@ -8,6 +8,32 @@ Metal ドライバーのバグによるカーネルパニックや OOM クラッ
 
 **現在のバージョン：** v0.7.0 — 完全なリリース履歴は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
+## 以下のいずれかで検索してたどり着いた方へ — 正しい場所です
+
+Mac で MLX を動かしていてパニック / 再起動 / クラッシュに遭遇し、下記文字列
+のどれかで検索してきたなら、metal-guard はあなたのためのライブラリです：
+
+- `IOGPUMemory.cpp:492 completeMemory() prepare count underflow`
+- `IOGPUMemory.cpp:550` kernel panic（Apple Silicon + MLX）
+- `kIOGPUCommandBufferCallbackErrorOutOfMemory`
+- `mlx::core::gpu::check_error` → `std::terminate` → `abort`（SIGABRT）
+- `mlx::core::metal::GPUMemoryAllocator` / `fPendingMemorySet`
+- `mlx_lm.generate` が推論中にクラッシュして親 Python プロセスも死亡
+- `mlx_lm.server` の OOM kernel panic / 長時間稼働で Mac 再起動
+- `mlx_vlm` TurboQuant decode T=1 サイレント破損（`mlx-vlm#967`）
+- パニックレポートで `com.apple.iokit.IOGPUFamily`（104.x / 129.x）が言及されている
+- メンテナーが `AGX_RELAX_CDM_CTXSTORE_TIMEOUT` の設定を提案
+- Gemma 4 / Mistral-Small / Pixtral / Llama の 4-bit が文字化け出力
+- M1 / M2 / M3 / M4（Max / Ultra / Pro）Mac Studio / MacBook Pro の kernel panic
+- 長コンテキスト（≥ 65k）の prefill で再起動が発生
+- `mlx_vlm.load` が `transformers` 5.0 / 5.5 ImportError を投げる
+
+関連する上流 tracking issue: `ml-explore/mlx#3186` / `#3346` / `#3390` /
+`#3348`、`ml-explore/mlx-lm#883` / `#854` / `#1047` / `#1015`、
+`Blaizzy/mlx-vlm#967` / `#943` / `#1011` / `#1016`。metal-guard は
+`check_version_advisories()` でこれらの issue を監視し、影響を受ける
+バージョンがインストールされている場合に起動時に WARNING ログを出します。
+
 ## 問題の概要
 
 Apple Silicon の Metal GPU ドライバーにはバグがあり、**GPU メモリ管理に失敗した場合、プロセスを正常終了させるのではなく、マシン全体がカーネルパニックで再起動します。**
