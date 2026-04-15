@@ -5,6 +5,53 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] — 2026-04-16
+
+Patch release wiring R4 (`require_prefill_fit`) into the actual call
+paths so prevention is **always-on** instead of opt-in. v0.7.0 shipped
+R4 as a public helper but callers had to remember to invoke it; a
+workload calling `call_model_isolated()` directly would still hit an
+IOGPU panic on an over-large prefill.
+
+### Changed
+
+- `_worker_main` (spawned by `MLXSubprocessRunner`) now calls
+  `require_prefill_fit()` between prompt formatting and the actual
+  `gen_fn(...)` dispatch. Tokenises the formatted prompt through the
+  already-loaded tokenizer (falls back to `len(prompt) // 4` if
+  tokenisation fails), adds `max_tokens`, looks up dims in
+  `KNOWN_MODELS`, and queries `memory_stats().available_gb`.
+  `MetalOOMError` raised by the guard is caught by the worker's
+  existing `except Exception` handler and returned to the parent as
+  a normal error reply — no crash, no SIGABRT.
+- `bench_scoped_load()` logs a `describe_prefill_plan(context=131072)`
+  advisory at scope entry when the model is in `KNOWN_MODELS`. Gives
+  the bench harness ahead-of-time visibility into which cells would
+  be refused before it wastes time loading the model.
+
+### Rationale
+
+Harper's 2026-04-15 kernel panic (Mistral-Small-3.2-24B × 131 k ×
+8-bit, estimate ≈ 30 GB single allocation) had R4 **available** in
+the library for ~17 hours before the actual panic — but nothing was
+calling it. The guard's value is zero if the prevention path is not
+reached on the happy path. This release closes the gap: any workload
+going through `MLXSubprocessRunner` (the subprocess-isolated call
+path, recommended for production) now gets R4 protection
+automatically.
+
+Unknown models continue to skip silently (debug log only); adding a
+model to `KNOWN_MODELS` is the one-line opt-in for any additional
+shape.
+
+### Tests
+
+126 passed, no regressions on existing suite. The prevention path
+itself is exercised by the Harper-local fork's test_prefill_guard_wire
+suite (5 cases covering known-model-at-131k raise, unknown-model
+skip, small-context pass, unpopulated stats skip, and tokenizer
+failure fallback).
+
 ## [0.7.0] — 2026-04-16
 
 Minor release adding the five R-series defences that were originally

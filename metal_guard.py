@@ -81,7 +81,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 log = logging.getLogger("metal_guard")
 
@@ -2337,6 +2337,31 @@ def bench_scoped_load(
     metal_guard.breadcrumb(f"BENCH_SCOPED_LOAD: ENTER {model_id} backend={backend}")
     log.info("bench_scoped_load: entering %s (backend=%s)", model_id, backend)
 
+    # R4 advisory (v0.7.0): if model has known dims, log prefill safety
+    # envelope at 131 072 context so the caller sees which cells would
+    # trip require_prefill_fit. Advisory only; never blocks load.
+    try:
+        _stats = metal_guard.memory_stats()
+        _plan = describe_prefill_plan(
+            context_tokens=131072, model_id=model_id,
+            available_gb=_stats.available_gb if _stats.limit_bytes > 0 else None,
+        )
+        if _plan["dims_known"]:
+            if _plan["fits_ceiling"] is False:
+                log.warning(
+                    "bench_scoped_load: %s at 131k ctx would alloc ~%s GB "
+                    "> 5 GB ceiling — R4 will refuse; recommend chunk=%s",
+                    model_id, _plan["peak_alloc_gb"],
+                    _plan["recommended_chunk_size"],
+                )
+            else:
+                log.info(
+                    "bench_scoped_load: %s prefill plan OK at 131k "
+                    "(peak ~%s GB)", model_id, _plan["peak_alloc_gb"],
+                )
+    except Exception as _exc:
+        log.debug("bench_scoped_load: prefill plan advisory failed: %s", _exc)
+
     # Acquire cross-process lock for the entire bench scope (load + yield + unload).
     # Unlike per-call acquisition, bench holds the lock across multiple
     # generate() calls on the same model — preventing other processes from
@@ -2652,6 +2677,30 @@ def _worker_main(
                     formatted = f"<|user|>\n{prompt}<|end|>\n<|assistant|>\n"
                 else:
                     formatted = prompt
+
+            # R4 auto-wire (v0.7.0): refuse prefills whose estimated peak
+            # allocation would risk IOGPUFamily kernel panic. Silently
+            # skips if model dims aren't in KNOWN_MODELS.
+            _dims = lookup_dims(model_id)
+            if _dims is not None:
+                try:
+                    _prompt_tok = tokenizer.encode(formatted)
+                    _prompt_len = len(_prompt_tok)
+                except Exception:
+                    _prompt_len = max(1, len(formatted) // 4)
+                _stats = metal_guard.memory_stats()
+                if _stats.limit_bytes > 0:
+                    # Raises MetalOOMError on breach → caught by the except
+                    # below and returned as an error reply, not a crash.
+                    require_prefill_fit(
+                        context_tokens=_prompt_len + max_tokens,
+                        dims=_dims,
+                        available_gb=_stats.available_gb,
+                    )
+                    metal_guard.breadcrumb(
+                        f"PREFILL_GUARD: OK model={model_id} "
+                        f"ctx={_prompt_len + max_tokens}"
+                    )
 
             result = gen_fn(
                 model, tokenizer,
