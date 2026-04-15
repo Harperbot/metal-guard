@@ -814,9 +814,13 @@ class TestZombieAwareLiveness:
 
 class TestVersionAdvisories:
     def test_returns_empty_for_clean_environment(self):
-        # Pretend only safe versions are installed.
+        # Pretend only safe versions are installed. Hypothetical future
+        # versions past every existing advisory range:
+        # mlx-lm 0.31.3 clears the 0.31.0–0.31.2 cluster;
+        # mlx 0.32.0 clears #3348, #3350, #3384, #3390;
+        # mlx-vlm 0.5.0 clears the 0.4.4 cluster.
         active = mg.check_version_advisories(
-            packages={"mlx-lm": "0.31.1", "mlx": "0.32.0", "mlx-vlm": "0.4.4"},
+            packages={"mlx-lm": "0.31.3", "mlx": "0.32.0", "mlx-vlm": "0.5.0"},
         )
         assert active == []
 
@@ -936,3 +940,396 @@ class TestUpstreamDefensivePatches:
 
         assert mg.install_upstream_defensive_patches()["mlx_lm_1128_think_start_id"] is False
         assert mg.install_upstream_defensive_patches(force=True)["mlx_lm_1128_think_start_id"] is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2026-04-16 community survey + R4/R5/R6/R8 port tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestNewAdvisories:
+    """9 new entries from 2026-04-15 (mlx-vlm) + 2026-04-16 (survey) cohorts."""
+
+    def test_mlx_vlm_967_race_fires_below_0_4_5(self):
+        active = mg.check_version_advisories(packages={"mlx-vlm": "0.4.4"})
+        issues = {a["issue"] for a in active}
+        assert "Blaizzy/mlx-vlm#967" in issues
+        race = next(a for a in active if a["issue"] == "Blaizzy/mlx-vlm#967")
+        assert race["severity"] == "critical"
+
+    def test_mlx_vlm_0_4_4_fires_all_four_cluster_entries(self):
+        active = mg.check_version_advisories(packages={"mlx-vlm": "0.4.4"})
+        issues = {a["issue"] for a in active}
+        for n in ("967", "1016", "1011", "943"):
+            assert f"Blaizzy/mlx-vlm#{n}" in issues
+
+    def test_mlx_vlm_0_4_5_clears_cluster(self):
+        active = mg.check_version_advisories(packages={"mlx-vlm": "0.4.5"})
+        issues = {a["issue"] for a in active}
+        for n in ("967", "1016", "1011", "943"):
+            assert f"Blaizzy/mlx-vlm#{n}" not in issues
+
+    def test_mlx_3384_sdpa_4bit_divergence_is_critical(self):
+        active = mg.check_version_advisories(packages={"mlx": "0.31.1"})
+        entry = next(
+            a for a in active if a["issue"] == "ml-explore/mlx#3384"
+        )
+        assert entry["severity"] == "critical"
+
+    def test_mlx_lm_897_applies_across_range(self):
+        for ver in ("0.31.0", "0.31.1", "0.31.2"):
+            active = mg.check_version_advisories(packages={"mlx-lm": ver})
+            issues = {a["issue"] for a in active}
+            assert "ml-explore/mlx-lm#897" in issues
+        active = mg.check_version_advisories(packages={"mlx-lm": "0.31.3"})
+        assert "ml-explore/mlx-lm#897" not in {
+            a["issue"] for a in active
+        }
+
+    def test_mlx_3350_fires_through_0_31_2(self):
+        for ver in ("0.31.0", "0.31.1", "0.31.2"):
+            active = mg.check_version_advisories(packages={"mlx": ver})
+            assert "ml-explore/mlx#3350" in {a["issue"] for a in active}
+
+    def test_mlx_3390_completion_abort_fires(self):
+        active = mg.check_version_advisories(packages={"mlx": "0.31.1"})
+        entry = next(
+            a for a in active if a["issue"] == "ml-explore/mlx#3390"
+        )
+        assert entry["severity"] == "high"
+        assert "AGX_RELAX_CDM_CTXSTORE_TIMEOUT" in entry["mitigation"]
+
+    def test_mlx_vlm_999_server_cache_thrash(self):
+        active = mg.check_version_advisories(packages={"mlx-vlm": "0.4.4"})
+        entry = next(
+            a for a in active if a["issue"] == "Blaizzy/mlx-vlm#999"
+        )
+        assert "server" in entry.get("scope", "").lower()
+
+
+class TestSystemAudit:
+    """R2 — wired_limit + IOGPUFamily kext version audits."""
+
+    def test_audit_wired_limit_default_mode(self, monkeypatch):
+        def fake_sysctl(name, *, timeout=2.0):
+            if name == "iogpu.wired_limit_mb":
+                return "0"
+            if name == "hw.memsize":
+                return str(128 * 1024 ** 3)
+            return None
+        monkeypatch.setattr(mg, "_sysctl", fake_sysctl)
+        result = mg.audit_wired_limit()
+        assert result["mode"] == "default"
+        assert result["advisory"] is None
+        assert result["total_gb"] == 128.0
+
+    def test_audit_wired_limit_override_over_threshold(self, monkeypatch):
+        def fake_sysctl(name, *, timeout=2.0):
+            if name == "iogpu.wired_limit_mb":
+                return str(120 * 1024)  # 120 GB
+            if name == "hw.memsize":
+                return str(128 * 1024 ** 3)
+            return None
+        monkeypatch.setattr(mg, "_sysctl", fake_sysctl)
+        result = mg.audit_wired_limit()
+        assert result["mode"] == "override"
+        assert result["advisory"] is not None
+        assert "mlx-lm#1047" in result["advisory"]
+
+    def test_audit_wired_limit_override_within_threshold(self, monkeypatch):
+        def fake_sysctl(name, *, timeout=2.0):
+            if name == "iogpu.wired_limit_mb":
+                return str(60 * 1024)
+            if name == "hw.memsize":
+                return str(128 * 1024 ** 3)
+            return None
+        monkeypatch.setattr(mg, "_sysctl", fake_sysctl)
+        result = mg.audit_wired_limit()
+        assert result["mode"] == "override"
+        assert result["advisory"] is None
+
+    def test_audit_wired_limit_unknown_on_sysctl_fail(self, monkeypatch):
+        monkeypatch.setattr(mg, "_sysctl", lambda *a, **kw: None)
+        result = mg.audit_wired_limit()
+        assert result["mode"] == "unknown"
+        assert result["advisory"] is None
+
+    def test_read_gpu_driver_version_returns_none_on_failure(self, monkeypatch):
+        import subprocess
+
+        def fake_run(*args, **kwargs):
+            raise subprocess.SubprocessError("mocked failure")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        # Both kextstat and ioreg paths fail → None
+        assert mg.read_gpu_driver_version(timeout=0.1) is None
+
+
+class TestPrefillGuard:
+    """R4 + R7."""
+
+    def test_estimate_131k_mistral_over_5gb(self):
+        dims = mg.KNOWN_MODELS["Mistral-Small-3.2-24B"]
+        peak = mg.estimate_prefill_peak_alloc_gb(
+            context_tokens=131072, dims=dims,
+        )
+        assert peak > 25.0
+
+    def test_lookup_dims_with_namespace_prefix(self):
+        dims = mg.lookup_dims("mlx-community/gemma-4-26b-a4b-it-4bit")
+        assert dims is not None
+        assert dims.n_heads == 16
+
+    def test_lookup_dims_unknown_returns_none(self):
+        assert mg.lookup_dims("no-such-model") is None
+
+    def test_require_fit_passes_for_small(self):
+        dims = mg.ModelDims(n_layers=16, n_heads=8, n_kv_heads=8, head_dim=128)
+        mg.require_prefill_fit(
+            context_tokens=512, dims=dims, available_gb=40.0,
+        )
+
+    def test_require_fit_raises_on_ceiling(self):
+        dims = mg.KNOWN_MODELS["Mistral-Small-3.2-24B"]
+        with pytest.raises(MetalOOMError, match="single-alloc ceiling"):
+            mg.require_prefill_fit(
+                context_tokens=131072, dims=dims, available_gb=200.0,
+            )
+
+    def test_require_fit_raises_on_headroom(self):
+        dims = mg.ModelDims(n_layers=40, n_heads=8, n_kv_heads=8, head_dim=128)
+        with pytest.raises(MetalOOMError, match="headroom"):
+            mg.require_prefill_fit(
+                context_tokens=20_000, dims=dims,
+                available_gb=4.5, single_alloc_ceiling_gb=10.0,
+            )
+
+    def test_recommend_chunk_full_fits(self):
+        dims = mg.ModelDims(n_layers=16, n_heads=8, n_kv_heads=8, head_dim=128)
+        assert mg.recommend_chunk_size(context_tokens=1024, dims=dims) == 1024
+
+    def test_recommend_chunk_binary_search(self):
+        dims = mg.KNOWN_MODELS["Mistral-Small-3.2-24B"]
+        chunk = mg.recommend_chunk_size(
+            context_tokens=131072, dims=dims, single_alloc_ceiling_gb=4.0,
+        )
+        assert chunk < 131072
+        assert mg.estimate_prefill_peak_alloc_gb(
+            context_tokens=chunk, dims=dims,
+        ) <= 4.0
+
+    def test_describe_plan_unknown_model(self):
+        d = mg.describe_prefill_plan(
+            context_tokens=4096, model_id="no-such-model",
+        )
+        assert d["dims_known"] is False
+        assert d["peak_alloc_gb"] is None
+
+    def test_describe_plan_131k_refused(self):
+        d = mg.describe_prefill_plan(
+            context_tokens=131072,
+            model_id="Mistral-Small-3.2-24B",
+            available_gb=60.0,
+        )
+        assert d["fits_ceiling"] is False
+        assert d["recommended_chunk_size"] is not None
+
+
+class TestKVTracker:
+    """R5 — per-request cumulative KV growth."""
+
+    def test_start_add_finalize(self):
+        t = mg.KVGrowthTracker()
+        t.start("r", ceiling_gb=1.0)
+        assert t.add_bytes("r", 100_000_000) == 100_000_000
+        summary = t.finalize("r")
+        assert summary["cumulative_gb"] == 0.1
+        assert summary["aborted"] is False
+
+    def test_ceiling_breach_raises(self):
+        t = mg.KVGrowthTracker()
+        t.start("r", ceiling_gb=0.1)
+        with pytest.raises(MetalOOMError, match="ceiling"):
+            t.add_bytes("r", 200_000_000)
+
+    def test_aborted_state_re_raises(self):
+        t = mg.KVGrowthTracker()
+        t.start("r", ceiling_gb=0.1)
+        with pytest.raises(MetalOOMError):
+            t.add_bytes("r", 200_000_000)
+        with pytest.raises(MetalOOMError):
+            t.add_bytes("r", 1)
+
+    def test_untracked_request_is_noop(self):
+        t = mg.KVGrowthTracker()
+        assert t.add_bytes("never-started", 1) == 0
+
+    def test_rejects_invalid_inputs(self):
+        t = mg.KVGrowthTracker()
+        with pytest.raises(ValueError):
+            t.start("r", ceiling_gb=0.0)
+        t.start("r", ceiling_gb=1.0)
+        with pytest.raises(ValueError):
+            t.add_bytes("r", -1)
+
+    def test_snapshot(self):
+        t = mg.KVGrowthTracker()
+        t.start("a", ceiling_gb=10.0)
+        t.start("b", ceiling_gb=10.0)
+        t.add_bytes("a", 5_000_000)
+        snap = {r["request_id"]: r["cumulative_gb"] for r in t.snapshot()}
+        assert snap["a"] == 0.005
+        assert snap["b"] == 0.0
+
+
+class TestProcessMode:
+    """R6 — process classification + mode-specific defaults."""
+
+    def test_subprocess_worker_env_wins(self, monkeypatch):
+        monkeypatch.setenv("METALGUARD_SUBPROCESS_WORKER", "1")
+        assert mg.detect_process_mode() == "subprocess_worker"
+
+    def test_mlx_server_argv(self, monkeypatch):
+        monkeypatch.delenv("METALGUARD_SUBPROCESS_WORKER", raising=False)
+        monkeypatch.setattr("sys.argv", ["python", "-m", "mlx_lm.server"])
+        assert mg.detect_process_mode() == "server"
+
+    def test_uvicorn_argv0(self, monkeypatch):
+        monkeypatch.delenv("METALGUARD_SUBPROCESS_WORKER", raising=False)
+        monkeypatch.setattr("sys.argv", ["/path/to/uvicorn", "app:app"])
+        assert mg.detect_process_mode() == "server"
+
+    def test_plain_script_is_cli(self, monkeypatch):
+        import sys as _sys
+        monkeypatch.delenv("METALGUARD_SUBPROCESS_WORKER", raising=False)
+        monkeypatch.setattr("sys.argv", ["my_script.py"])
+        monkeypatch.delitem(_sys.modules, "ipykernel", raising=False)
+        assert mg.detect_process_mode() == "cli"
+
+    def test_apply_defaults_includes_mode_key(self):
+        d = mg.apply_mode_defaults("server")
+        assert d["mode"] == "server"
+        assert "generate_timeout_sec" in d
+
+    def test_server_stricter_than_notebook(self):
+        srv = mg.apply_mode_defaults("server")
+        nb = mg.apply_mode_defaults("notebook")
+        assert srv["generate_timeout_sec"] < nb["generate_timeout_sec"]
+
+    def test_subprocess_worker_skips_lock(self):
+        d = mg.apply_mode_defaults("subprocess_worker")
+        assert d.get("skip_process_lock") is True
+
+    def test_describe_has_required_keys(self):
+        d = mg.describe_process_mode()
+        for key in ("mode", "argv0", "has_ipykernel", "defaults"):
+            assert key in d
+
+
+class TestAppleFeedback:
+    """R8 — Feedback Assistant formatter."""
+
+    _SAMPLE = {
+        "panic_string": "IOGPUMemory.cpp:492 underflow",
+        "panic_time": "2026-04-15T23:30:45Z",
+        "hardware": {"chip": "M1 Ultra", "gpu_memory_gb": 128},
+        "gpu_driver": "104.6.3",
+        "os_version": "Darwin 24.6.0",
+        "kernel_version": "Darwin Kernel 24.6.0",
+        "mlx_versions": {"mlx": "0.31.1"},
+        "repro_steps": ["Load Mistral 131k", "Observe panic"],
+        "breadcrumbs": ["[23:06] LOAD START", "[23:25] CELL_START 131072"],
+        "advisories": [{
+            "severity": "critical", "package": "mlx", "installed_version": "0.31.1",
+            "title": "SDPA 4-bit divergence", "url": "https://example.com/1",
+        }],
+    }
+
+    def test_full_forensics_has_sections(self):
+        report = mg.format_panic_for_apple_feedback(self._SAMPLE)
+        for section in ("## System", "## Reproducer", "## Active advisories",
+                        "## Breadcrumb tail", "mlx#3186"):
+            assert section in report
+
+    def test_exclude_breadcrumb_option(self):
+        report = mg.format_panic_for_apple_feedback(
+            self._SAMPLE, include_breadcrumb=False,
+        )
+        assert "Breadcrumb tail" not in report
+        assert "CELL_START 131072" not in report
+
+    def test_empty_forensics_renders_unknown(self):
+        report = mg.format_panic_for_apple_feedback({})
+        assert "unknown" in report
+        assert "PANIC STRING" in report
+
+    def test_truncates_long_breadcrumbs(self):
+        forensics = dict(self._SAMPLE)
+        forensics["breadcrumbs"] = [f"line {i}" for i in range(200)]
+        report = mg.format_panic_for_apple_feedback(
+            forensics, max_breadcrumb_lines=10,
+        )
+        assert "line 190" in report
+        assert "line 189" not in report
+
+
+def _module_level_stub_worker(model_id, backend, recv_conn, send_conn):
+    """Module-level stub worker so multiprocessing spawn can pickle it.
+
+    macOS multiprocessing default is spawn; local / closure functions
+    are not picklable, so MLXSubprocessRunner tests that inject a fake
+    worker must reference an importable name.
+    """
+    import multiprocessing
+    send_conn.send({
+        "type": "ready",
+        "model_id": model_id,
+        "pid": multiprocessing.current_process().pid,
+    })
+    try:
+        while True:
+            if not recv_conn.poll(timeout=5):
+                break
+            msg = recv_conn.recv()
+            if msg is None or msg.get("type") == "shutdown":
+                break
+    except (EOFError, OSError):
+        pass
+
+
+class TestSubprocessRunnerLock:
+    """H7 — MLXSubprocessRunner acquires the cross-process MLX lock."""
+
+    def test_runner_acquires_lock_on_init(self, _isolated_lock, monkeypatch):
+        """Construction writes this process's pid to the lock file."""
+        monkeypatch.setattr(mg, "_worker_main", _module_level_stub_worker)
+
+        runner = mg.MLXSubprocessRunner("fake-model")
+        try:
+            holder = mg.read_mlx_lock()
+            assert holder is not None
+            assert "mlx_subprocess_runner" in holder["label"]
+        finally:
+            runner.shutdown()
+
+    def test_runner_releases_on_shutdown(self, _isolated_lock, monkeypatch):
+        monkeypatch.setattr(mg, "_worker_main", _module_level_stub_worker)
+
+        runner = mg.MLXSubprocessRunner("fake-model")
+        assert mg.read_mlx_lock() is not None
+        runner.shutdown()
+        assert mg.read_mlx_lock() is None
+
+    def test_runner_refuses_if_other_live_process_holds_lock(
+        self, _isolated_lock, monkeypatch,
+    ):
+        """Pre-write lock with os.getppid() (live, not us)."""
+        import json
+        import os as _os
+        other_pid = _os.getppid()
+        _isolated_lock.write_text(json.dumps({
+            "pid": other_pid, "label": "simulated_peer",
+            "started_at": "2026-04-16T00:00:00Z",
+            "cmdline": "peer", "host": "test",
+        }))
+        with pytest.raises(MLXLockConflict):
+            mg.MLXSubprocessRunner("fake-model")

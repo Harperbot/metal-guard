@@ -6,7 +6,7 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version:** v0.6.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
+**Current version:** v0.7.0 — see [CHANGELOG.md](CHANGELOG.md) for the full release history.
 
 ## The Problem
 
@@ -76,6 +76,133 @@ model, tokenizer = mlx_lm.load("my-model-8bit")
 # 4. Breadcrumbs for crash forensics
 metal_guard.breadcrumb("LOAD: my-model-8bit START")
 ```
+
+## v0.7.0 Features
+
+### The 7th kernel-panic root-cause class — completion-handler abort
+
+Harper's 2026-04-16 survey of every MLX / mlx-lm / mlx-vlm issue filed
+since mlx-lm 0.31.2 (~250 issues + 80 PRs) surfaced a root cause that
+metal-guard could not previously name: `eval.cpp::check_error` throws
+from `addCompletedHandler(...)` callbacks running on Apple's
+`com.Metal.CompletionQueueDispatch` (GCD) queue. libdispatch blocks
+are not exception-safe — `__cxa_throw` → `std::terminate` → `abort()`
+→ uncatchable SIGABRT. Python's `try/except` around `mx.eval()` never
+fires. Duplicate reports: `mlx#3224` (M3 Ultra 6 hr), `mlx#3317`
+(M2 Ultra asyncio race). Umbrella: `mlx#2670`. PR #3318
+(`check_error_deferred`) was closed without merge — upstream stance
+is that process state is undefined post-throw.
+
+metal-guard can only **partially mitigate** this class:
+
+- `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` is auto-set at module import
+  (since v0.5.0), which reduces the GPU watchdog false-positives that
+  most commonly trigger the abort.
+- Subprocess isolation via `MLXSubprocessRunner` keeps the parent and
+  sibling workers alive; only the in-flight child dies. The in-flight
+  request itself is lost.
+
+This is now called out explicitly in `_VERSION_ADVISORIES` with
+severity `high` and full mitigation notes.
+
+### R4 — Prefill allocation guard
+
+```python
+from metal_guard import (
+    ModelDims, KNOWN_MODELS, require_prefill_fit, recommend_chunk_size,
+)
+
+dims = KNOWN_MODELS["Mistral-Small-3.2-24B"]
+require_prefill_fit(
+    context_tokens=131_072, dims=dims, available_gb=60.0,
+)
+# MetalOOMError: Prefill peak alloc 30.1 GB > single-alloc ceiling
+# 5.0 GB. IOGPUFamily state corruption risk (mlx#3186).
+```
+
+Attention score tensors scale quadratically in context. Mistral-Small
+24B × 131 k estimates ≈ 30 GB in a single Metal dispatch — well past
+the empirical ~5 GB single-allocation ceiling where IOGPUFamily
+starts corrupting state even when the device has 60+ GB free. A real
+2026-04-15 kernel panic had exactly this shape; R4 refuses the load
+before `mlx_lm.load` runs.
+
+`recommend_chunk_size(...)` binary-searches the largest chunk that
+fits — advisory only, metal-guard does not auto-chunk.
+
+### R5 — Per-request KV cumulative tracker
+
+```python
+from metal_guard import kv_tracker
+
+kv_tracker.start(request_id, ceiling_gb=10.0)
+try:
+    for tok in generate(...):
+        kv_tracker.add_bytes(request_id, bytes_this_step)
+        yield tok
+finally:
+    kv_tracker.finalize(request_id)
+```
+
+`MetalGuard.start_kv_cache_monitor` watches *global* Metal pressure
+— a long-running request that steadily grows its KV cache can push
+the device past the IOGPUFamily threshold while the global metric
+still looks fine. Per-request tracking catches that specific request
+early. Opt-in; untracked requests are no-ops.
+
+### R6 — Process-mode detection
+
+```python
+from metal_guard import detect_process_mode, apply_mode_defaults
+
+mode = detect_process_mode()  # "server" | "cli" | "subprocess_worker" | ...
+cfg = apply_mode_defaults(mode)
+# {'mode': 'server', 'generate_timeout_sec': 60.0, 'kv_ceiling_gb': 10.0, ...}
+```
+
+`server` mode is stricter (60 s generate timeout, 10 GB KV ceiling,
+4 GB prefill ceiling) than `notebook` (600 s / 30 GB / 5 GB).
+mlx-lm `#883` / `#854` clustered panic reports around long-lived
+server loops that never flushed between concurrent requests — the
+stricter defaults address that class.
+
+### R8 — Apple Feedback Assistant formatter
+
+```python
+from metal_guard import format_panic_for_apple_feedback
+
+report = format_panic_for_apple_feedback(forensics_dict)
+# Paste directly into Feedback Assistant.
+```
+
+Mirrors the `mlx#3186` (FB22091885) template. Null-tolerant for
+missing fields; optional breadcrumb suppression when forensics carry
+prompt-sensitive content.
+
+### H7 — MLXSubprocessRunner now acquires the MLX lock
+
+`MLXSubprocessRunner.__init__` calls `acquire_mlx_lock(...)` before
+spawning the worker and releases it on both graceful shutdown and
+forced kill. This closes the last gap in cross-process MLX exclusion:
+`bench_scoped_load()` and `call_model()` already acquired the lock,
+but the subprocess runner did not — any concurrent MLX acquirer
+could legally overwrite the lock mid-run while the worker was still
+holding Metal buffers. Real kernel panic on 2026-04-15 had this
+exact shape: a pytest run stole the lock from a running bench.
+
+The worker also now sets `METALGUARD_SUBPROCESS_WORKER=1` in its own
+environment so `detect_process_mode()` returns `"subprocess_worker"`
+inside the child, preventing double lock acquisition.
+
+### System-level audits (R2 / R3) — now public API
+
+- `audit_wired_limit()` — `sysctl iogpu.wired_limit_mb` > 85 % triggers
+  an advisory per `mlx-lm#1047`.
+- `read_gpu_driver_version()` — `IOGPUFamily` kext bundle version for
+  forensic correlation with `mlx#3186`.
+- `log_system_audit_at_startup()` — convenience entry point.
+
+---
 
 ## v0.6.0 Features
 

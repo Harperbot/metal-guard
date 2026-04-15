@@ -6,7 +6,7 @@
 
 防止因 Metal 驅動程式 bug 導致的 kernel panic 和 OOM crash——特別是多模型管線、長時間運行的伺服器，以及大量 tool calling 的 agent 框架。
 
-**目前版本：** v0.6.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
+**目前版本：** v0.7.0 — 完整發佈歷史見 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 問題是什麼
 
@@ -56,6 +56,91 @@ metal_guard.safe_cleanup()
 # 3. 載入前檢查記憶體
 metal_guard.ensure_headroom(model_name="my-model-8bit")
 ```
+
+## v0.7.0 新功能
+
+### 第 7 條 kernel panic root cause — completion-handler abort
+
+Harper 2026-04-16 掃完整個 MLX 生態自 mlx-lm 0.31.2 後的 issue（約 250 條 issue + 80 條 PR），發現一條 metal-guard 原本沒點名的 root cause：`eval.cpp::check_error` 在 `addCompletedHandler(...)` 的 callback 裡拋例外，這些 callback 跑在 Apple 的 `com.Metal.CompletionQueueDispatch`（GCD）queue 上。libdispatch block 不是 exception-safe——`__cxa_throw` → `std::terminate` → `abort()` → 無法攔截的 SIGABRT。Python 在 `mx.eval()` 外的 `try/except` 永遠不會觸發。重複報告：`mlx#3224`（M3 Ultra 跑 6 小時）、`mlx#3317`（M2 Ultra asyncio race）。Umbrella：`mlx#2670`。PR #3318（`check_error_deferred` 模式）被 closed 不 merge——上游認定「throw 後 process state 已 undefined」。
+
+metal-guard 對這條只能**部分緩解**：
+
+- `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` 自 v0.5.0 起 module import 時自動設定，降低最常觸發 abort 的 GPU watchdog false-positive 頻率
+- 透過 `MLXSubprocessRunner` 的 subprocess 隔離讓 parent 和兄弟 worker 存活；in-flight child 會死、in-flight request 會丟
+
+`_VERSION_ADVISORIES` 已加入此 issue（severity `high` + 完整 mitigation）。
+
+### R4 — Prefill 配置防線
+
+```python
+from metal_guard import (
+    ModelDims, KNOWN_MODELS, require_prefill_fit, recommend_chunk_size,
+)
+
+dims = KNOWN_MODELS["Mistral-Small-3.2-24B"]
+require_prefill_fit(
+    context_tokens=131_072, dims=dims, available_gb=60.0,
+)
+# MetalOOMError: Prefill peak alloc 30.1 GB > single-alloc ceiling
+# 5.0 GB. IOGPUFamily state corruption risk (mlx#3186).
+```
+
+Attention score tensor 跟 context 平方成長。Mistral-Small 24B × 131k 估算單次 Metal dispatch 要 ~30 GB——遠超實測約 5 GB 的 single-allocation 天花板（即使 device 上還有 60+ GB 空閒，IOGPUFamily 也會開始 corrupt state）。Harper 2026-04-15 踩到這條，整機 reboot；R4 在 `mlx_lm.load` 跑之前就會 refuse。
+
+`recommend_chunk_size(...)` 用 binary search 找最大可容納的 chunk——純 advisory，metal-guard 不會替 caller 自動分 chunk。
+
+### R5 — Per-request KV 累積 tracker
+
+```python
+from metal_guard import kv_tracker
+
+kv_tracker.start(request_id, ceiling_gb=10.0)
+try:
+    for tok in generate(...):
+        kv_tracker.add_bytes(request_id, bytes_this_step)
+        yield tok
+finally:
+    kv_tracker.finalize(request_id)
+```
+
+`MetalGuard.start_kv_cache_monitor` 看的是**全 device** Metal pressure——單一長 request 慢慢長 KV cache 可能在 global metric 看起來還正常的時候，已經推過 IOGPUFamily 閾值。per-request tracking 早一步在那個 request 身上攔截。opt-in；未啟用的 request 不會影響 generate loop。
+
+### R6 — Process mode 偵測
+
+```python
+from metal_guard import detect_process_mode, apply_mode_defaults
+
+mode = detect_process_mode()  # "server" | "cli" | "subprocess_worker" | ...
+cfg = apply_mode_defaults(mode)
+# {'mode': 'server', 'generate_timeout_sec': 60.0, 'kv_ceiling_gb': 10.0, ...}
+```
+
+`server` 模式嚴格（60 秒 generate timeout、10 GB KV ceiling、4 GB prefill ceiling），`notebook` 寬鬆（600 / 30 / 5）。mlx-lm `#883` / `#854` 把多起 panic 集中在「server 長時間跑、concurrent request 之間沒 flush」的情境——嚴格預設值正是為了守這類 case。
+
+### R8 — Apple Feedback Assistant 格式器
+
+```python
+from metal_guard import format_panic_for_apple_feedback
+
+report = format_panic_for_apple_feedback(forensics_dict)
+# 直接貼進 Feedback Assistant
+```
+
+對齊 `mlx#3186`（FB22091885）的 template。欄位缺失時容錯渲染為 `unknown`；forensic 內含敏感 prompt 時可透過 flag 關掉 breadcrumb 段。
+
+### H7 — MLXSubprocessRunner 現在會取 MLX lock
+
+`MLXSubprocessRunner.__init__` 在 spawn worker 前呼叫 `acquire_mlx_lock(...)`，shutdown / kill 兩個路徑都會 release。這補上了跨 process 互斥的最後一個洞：`bench_scoped_load()` 跟 `call_model()` 早就會取 lock，但 subprocess runner 原本沒有——任何 concurrent MLX acquirer（跑 `bench_scoped_load` 的 pytest、第二個 bench CLI、acceptance test）可以在 worker 還抱著 Metal buffer 的時候合法地覆蓋 lock file。2026-04-15 的真實 kernel panic 就是這個 shape：pytest 從 bench 手上搶到 lock。
+
+worker 本身現在也會把 `METALGUARD_SUBPROCESS_WORKER=1` 寫進 env，讓 child 內部的 `detect_process_mode()` 回傳 `"subprocess_worker"`——避免重複取已經被 parent 持有的 lock。
+
+### 系統層 audit（R2 / R3）現在是 public API
+
+- `audit_wired_limit()` — `sysctl iogpu.wired_limit_mb` 超過 85% 觸發 advisory（依 `mlx-lm#1047`）
+- `read_gpu_driver_version()` — 讀 `IOGPUFamily` kext bundle 版本，為未來 `mlx#3186` 類型的 crash 建 forensic 對應基準
+- `log_system_audit_at_startup()` — 一次跑完以上兩項的 convenience entry point
+
+---
 
 ## v0.6.0 新功能
 

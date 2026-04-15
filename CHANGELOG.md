@@ -5,6 +5,170 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] — 2026-04-16
+
+Minor release adding the five R-series defences that were originally
+written to Harper's internal fork (`lib/mlx_client`) and validated
+against real 4-bit MAGI / bench workloads across March and April
+2026. This release rolls them into the open-source single-file
+distribution and adds nine new version advisories plus a 7th
+documented kernel-panic root-cause class.
+
+### Added (features)
+
+- **R2 — System-level audits.** Two new module-level functions:
+  - `audit_wired_limit()` reads `sysctl iogpu.wired_limit_mb` and flags
+    explicit overrides exceeding 85 % of unified memory. Per mlx-lm
+    maintainer `angeloskath` on `ml-explore/mlx-lm#1047`, too-high
+    wired-memory overrides are correlated with IOGPUFamily kernel
+    panics. Returns `mode="default" / "override" / "unknown"` with an
+    optional `advisory` string.
+  - `read_gpu_driver_version()` reads the `IOGPUFamily` kext bundle
+    version via `kextstat` (falls back to `ioreg`). Panic reports on
+    `ml-explore/mlx#3186` pin the fault to this specific kext, so
+    recording the driver revision at startup gives forensic context
+    for future crash correlation.
+  - `log_system_audit_at_startup()` is the convenience entry point
+    for CLI `main()` or FastAPI lifespans.
+
+- **R4 — Prefill allocation guard.** New `ModelDims` dataclass, a
+  curated `KNOWN_MODELS` table (Gemma 4 family, Mistral Small 3.2,
+  Pixtral, Hermes 3 Llama 3.1, LFM2-VL), plus:
+  - `estimate_prefill_peak_alloc_gb(context_tokens, dims)` returns
+    the larger of the per-layer attention-score tensor and the
+    whole-model KV cache. Scores scale quadratically in context; KV
+    linearly.
+  - `require_prefill_fit(context_tokens, dims, available_gb,
+    single_alloc_ceiling_gb=5.0, headroom_pct=0.30)` raises
+    `MetalOOMError` before `mlx_lm.load` / `mlx_vlm.load` runs if the
+    estimate exceeds either the hard 5 GB single-allocation ceiling
+    (IOGPUFamily state corruption risk per mlx#3186) or the available
+    memory headroom. The 131 k × Mistral-Small-3.2-24B × 8-bit case
+    that caused a real kernel panic on 2026-04-15 estimates ≈ 30 GB
+    and is refused.
+  - `describe_prefill_plan(context_tokens, model_id, available_gb)`
+    returns a dashboard-safe null-tolerant summary.
+
+- **R5 — Per-request KV cumulative tracker.** New `KVGrowthTracker`
+  class plus a module-level `kv_tracker` singleton. The existing
+  `MetalGuard.start_kv_cache_monitor` watches *global* Metal pressure
+  — a long-running request that steadily grows its KV cache can push
+  the device past the IOGPUFamily threshold while the global metric
+  still looks fine. `kv_tracker.start(request_id, ceiling_gb=…)` /
+  `add_bytes(request_id, bytes)` / `finalize(request_id)` catches
+  that specific request before the global metric crosses. Opt-in;
+  untracked requests are no-ops.
+
+- **R6 — Process-mode detection.** `detect_process_mode()` classifies
+  the current process as `server` / `embedded` / `notebook` / `cli` /
+  `subprocess_worker`. `apply_mode_defaults(mode)` returns
+  mode-specific timeouts, flush intervals, KV ceilings, and prefill
+  allocation caps. `subprocess_worker` mode carries
+  `skip_process_lock=True` since the parent already owns the
+  cross-process lock. Detection uses `METALGUARD_SUBPROCESS_WORKER=1`
+  (set automatically by `MLXSubprocessRunner` in the child), then
+  argv inspection for `mlx_lm.server` / `uvicorn` / `gunicorn`, then
+  `ipykernel` import for notebook, then script-name heuristics.
+
+- **R7 — Chunked-prefill advisory.** `recommend_chunk_size(
+  context_tokens, dims, single_alloc_ceiling_gb=4.0)` binary-searches
+  the largest chunk whose estimate fits the ceiling. Purely advisory
+  — metal-guard does not chunk on behalf of the caller.
+
+- **R8 — Apple Feedback Assistant panic formatter.**
+  `format_panic_for_apple_feedback(forensics, include_breadcrumb=True,
+  max_breadcrumb_lines=60)` converts a forensics dict into a
+  ready-to-paste Feedback Assistant report mirroring the
+  `ml-explore/mlx#3186` (FB22091885) template. Null-tolerant for
+  missing fields; optional breadcrumb suppression for
+  prompt-sensitive content.
+
+### Added (advisories)
+
+Nine new entries in `_VERSION_ADVISORIES`:
+
+- `Blaizzy/mlx-vlm#967` (`<0.4.5`, **critical**) — TurboQuant fused
+  quantize race; decode T=1 silent corruption.
+- `Blaizzy/mlx-vlm#1016` (`==0.4.4`, high) — `prefill_attention`
+  always returns None after #909; silent full dequantize for
+  externally-built TQ caches.
+- `Blaizzy/mlx-vlm#1011` (`==0.4.4`, high) — Gemma 4 loading fails
+  with transformers 5.5.x (`ReasoningEffort` ImportError).
+- `Blaizzy/mlx-vlm#943` (`==0.4.4`, **critical**) — Gemma 4
+  26b-a4b-it-4bit vision NaN corruption (model-scoped).
+- `ml-explore/mlx#3384` (`<=0.31.1`, **critical**) — SDPA numerical
+  divergence / token repetition on 4-bit quantised models. Silent
+  quality regression in a hot path.
+- `ml-explore/mlx-lm#897` (`>=0.31.0,<=0.31.2`, high) —
+  `mlx_lm.server` chat completions crash with transformers ≥ 5.0.
+- `Blaizzy/mlx-vlm#999` (`==0.4.4`, high) — server clears Metal
+  cache after every request, destroying KV prefix cache.
+- `ml-explore/mlx#3350` (`<=0.31.2`, high) — Metal allocator buffer
+  pool unbounded growth on monotonic-size allocations. Maintainer
+  closed won't-fix; mitigation pushed to callers
+  (`mx.set_cache_limit` + `mx.clear_cache` on growth thresholds).
+- `ml-explore/mlx#3390` / `#3317` / `#3224` (`<=0.31.2`, high) —
+  **the 7th kernel-panic root-cause class.** `eval.cpp::check_error`
+  throws from Metal completion handlers running on
+  `com.Metal.CompletionQueueDispatch` (libdispatch/GCD); blocks on
+  that queue are not exception-safe, so `std::terminate` → `abort()`
+  → uncatchable SIGABRT. PR #3318 proposed `check_error_deferred`
+  and was closed without merge — upstream stance is that process
+  state is undefined post-throw and the fix belongs in general
+  thread-safety work. metal-guard can only partially mitigate:
+  `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` (auto-set at module import
+  since v0.5.0) reduces the GPU watchdog false-positives that most
+  commonly trigger this abort, and subprocess isolation via
+  `MLXSubprocessRunner` keeps the parent and sibling workers alive.
+
+### Added (subprocess runner hardening — H7)
+
+`MLXSubprocessRunner.__init__` now calls `acquire_mlx_lock(
+f"mlx_subprocess_runner:{model_id}")` before spawning the worker,
+and releases the lock through `_cleanup()` on both graceful
+shutdown and forced kill. This closes the last gap in cross-process
+MLX exclusion: `bench_scoped_load()` and `call_model()` already
+acquired the lock, but `MLXSubprocessRunner` did not — any
+concurrent MLX acquirer (pytest running `bench_scoped_load`, a
+second bench CLI, an acceptance test) could legally overwrite the
+lock mid-run while the subprocess was still holding Metal buffers.
+This was the root cause of a real kernel panic on 2026-04-15 where
+a pytest run inadvertently stole the lock from a running bench.
+
+The worker also now sets `METALGUARD_SUBPROCESS_WORKER=1` in its
+own environment so `detect_process_mode()` inside the child returns
+`"subprocess_worker"` and picks up the `skip_process_lock=True`
+default, preventing the child from trying to re-acquire the lock
+the parent already owns.
+
+### Fixed
+
+- `test_returns_empty_for_clean_environment` updated to use
+  `mlx-lm 0.31.3` / `mlx 0.32.0` / `mlx-vlm 0.5.0` as its clean-version
+  sentinel — hypothetical future releases past every existing
+  advisory range.
+
+### Test results
+
+126 passed (82 baseline + 44 new covering advisories, `audit_wired_limit`
+with mocked sysctl, prefill estimate/require_fit/recommend_chunk_size,
+KVGrowthTracker concurrency and ceiling breach, process mode detection
+across argv variants, Apple Feedback formatter section presence and
+breadcrumb truncation, and MLXSubprocessRunner lock acquire / release /
+refuse).
+
+### Not included (deferred)
+
+- Inflight breadcrumb wrap around `mx.eval()` / `generate()` for
+  forensic tagging of which request was in-flight at a completion-handler
+  abort. The current subprocess reap path gives `(pid, model_id)`; a
+  richer `(pid, model_id, prompt_hash, token_idx, wall_clock)`
+  breadcrumb is planned but not yet implemented — await the 7th-class
+  panic to become frequent enough to justify the additional write path.
+- Stress test reproducing `mlx-lm#883` / `#854` server-mode behaviour.
+  R6 provides defaults; actually launching a server to stress-test is
+  separate work.
+
 ## [0.6.0] — 2026-04-14
 
 ### Changed (behaviour)

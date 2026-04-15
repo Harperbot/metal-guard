@@ -81,7 +81,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -1676,6 +1676,238 @@ _VERSION_ADVISORIES: list[tuple[str, str, dict[str, Any]]] = [
             ),
         },
     ),
+    # ── 2026-04-15 mlx-vlm 0.4.4 cluster ──────────────────────────────────
+    (
+        "mlx-vlm",
+        "<0.4.5",
+        {
+            "issue": "Blaizzy/mlx-vlm#967",
+            "severity": "critical",
+            "title": "TurboQuant fused quantize race condition (decode T=1 silent corruption)",
+            "url": "https://github.com/Blaizzy/mlx-vlm/pull/967",
+            "symptom": (
+                "Race on Metal threadgroup `packed_shared[w] |= idx_val << shift` "
+                "(non-atomic) corrupts decode-time T=1 kernels. 4-bit "
+                "TurboQuant output measurably worse than 2-bit; existing "
+                "tests (T>1 prefill path) pass unchanged, making this a "
+                "silent regression."
+            ),
+            "mitigation": (
+                "Upgrade to mlx-vlm >= 0.4.5 when released (fix merged "
+                "2026-04-07). Until then, avoid kv_quant_scheme=\"turboquant\" "
+                "for decode-heavy workloads. Recommend PPL / logit cosine "
+                "quality gate before trusting any TQ speedup numbers."
+            ),
+        },
+    ),
+    (
+        "mlx-vlm",
+        "==0.4.4",
+        {
+            "issue": "Blaizzy/mlx-vlm#1016",
+            "severity": "high",
+            "title": "prefill_attention always returns None after #909 (silent full dequantize)",
+            "url": "https://github.com/Blaizzy/mlx-vlm/issues/1016",
+            "symptom": (
+                "Downstream projects that create TurboQuantKVCache instances "
+                "*before* prefill silently dequantize the entire KV to fp16 "
+                "during prefill (~31 GB activation memory at 128K context "
+                "on gemma-4-31B per PR #939 benchmarks)."
+            ),
+            "mitigation": (
+                "Only affects callers that build TQ caches externally. "
+                "mlx-vlm's own generate() uses post-conversion and is "
+                "unaffected. If affected, pin mlx-vlm < the upgrade "
+                "containing the fix PR or keep TQ disabled at prefill-time."
+            ),
+        },
+    ),
+    (
+        "mlx-vlm",
+        "==0.4.4",
+        {
+            "issue": "Blaizzy/mlx-vlm#1011",
+            "severity": "high",
+            "title": "Gemma 4 loading fails with transformers 5.5.x (ReasoningEffort ImportError)",
+            "url": "https://github.com/Blaizzy/mlx-vlm/issues/1011",
+            "symptom": (
+                "ImportError: cannot import name 'ReasoningEffort' from "
+                "'transformers' when loading any Gemma 4 variant via "
+                "mlx_vlm.load()."
+            ),
+            "mitigation": (
+                "Pin transformers < 5.5 in venvs that load Gemma 4 via "
+                "mlx-vlm. No monkey-patch available — transformers API "
+                "removed the attribute."
+            ),
+        },
+    ),
+    (
+        "mlx-vlm",
+        "==0.4.4",
+        {
+            "issue": "Blaizzy/mlx-vlm#943",
+            "severity": "critical",
+            "title": "Gemma 4 26b-a4b-it-4bit vision produces garbage (text-only unaffected)",
+            "url": "https://github.com/Blaizzy/mlx-vlm/issues/943",
+            "symptom": (
+                "NaN propagation in all-masked SDPA padding rows on Gemma 4 "
+                "vision branch → degenerate output on mlx-community/"
+                "gemma-4-26b-a4b-it-4bit image inputs. Text-only path OK."
+            ),
+            "mitigation": (
+                "Avoid gemma-4-26b-a4b-it-4bit for vision tasks until PR "
+                "#1006 ships. Substitute pixtral-12b-4bit or "
+                "gemma-4-e4b-it-4bit for vision."
+            ),
+            "scope": "model:mlx-community/gemma-4-26b-a4b-it-4bit backend:mlx-vlm",
+        },
+    ),
+    # ── 2026-04-16 community survey additions ─────────────────────────────
+    # Scanned every MLX / mlx-lm / mlx-vlm issue since mlx-lm 0.31.2
+    # released (2026-02-01+). These five are actionable safety /
+    # correctness reports affecting typical MLX usage patterns.
+    (
+        "mlx",
+        "<=0.31.1",
+        {
+            "issue": "ml-explore/mlx#3384",
+            "severity": "critical",
+            "title": "fast.scaled_dot_product_attention numerical divergence on 4-bit quantized models",
+            "url": "https://github.com/ml-explore/mlx/issues/3384",
+            "symptom": (
+                "Token repetition / divergent logits from the fused SDPA "
+                "kernel when inputs are 4-bit quantized. Silent — "
+                "generation does not crash, just produces worse output. "
+                "Non-quantised correctness tests pass unchanged; this is "
+                "a regression only visible at the 4-bit decode step."
+            ),
+            "mitigation": (
+                "4-bit is the default deployment format for many users. "
+                "No safe in-place shim; fall back to a non-fused attention "
+                "path or avoid affected sizes if quality regression "
+                "appears. Monitor PPL / logit cosine before trusting "
+                "4-bit speedups until a fix lands."
+            ),
+            "scope": "backend:mlx",
+        },
+    ),
+    (
+        "mlx-lm",
+        ">=0.31.0,<=0.31.2",
+        {
+            "issue": "ml-explore/mlx-lm#897",
+            "severity": "high",
+            "title": "mlx_lm.server: chat completions crash with transformers >= 5.0 (return_dict=False missing)",
+            "url": "https://github.com/ml-explore/mlx-lm/issues/897",
+            "symptom": (
+                "Server chat endpoint raises because call to HF transformers "
+                "no longer accepts the positional signature used here. "
+                "Only affects `mlx_lm.server`; CLI `generate` is unaffected."
+            ),
+            "mitigation": (
+                "Pin transformers < 5.0 in venvs that launch the HTTP "
+                "server, or wait for a mlx-lm release that includes the "
+                "server-side fix."
+            ),
+            "scope": "backend:mlx-lm component:server",
+        },
+    ),
+    (
+        "mlx-vlm",
+        "==0.4.4",
+        {
+            "issue": "Blaizzy/mlx-vlm#999",
+            "severity": "high",
+            "title": "server clears Metal cache after every request — destroys KV prefix cache",
+            "url": "https://github.com/Blaizzy/mlx-vlm/issues/999",
+            "symptom": (
+                "`mlx_vlm` server calls `mx.clear_cache()` (and sync "
+                "barriers) at the end of every request handler. The "
+                "per-conversation KV prefix cache is dropped, forcing "
+                "full re-prefill every turn — major latency plus Metal "
+                "allocator thrash that can cascade into IOGPUFamily "
+                "pressure."
+            ),
+            "mitigation": (
+                "If running the HTTP server, disable per-request cache "
+                "clears and rely on a between-model cooldown policy "
+                "instead. Upstream fix pending."
+            ),
+            "scope": "backend:mlx-vlm component:server",
+        },
+    ),
+    (
+        "mlx",
+        "<=0.31.2",
+        {
+            "issue": "ml-explore/mlx#3350",
+            "severity": "high",
+            "title": "Metal allocator buffer pool grows unboundedly on monotonic-size allocations",
+            "url": "https://github.com/ml-explore/mlx/issues/3350",
+            "symptom": (
+                "MetalAllocator::free() unconditionally recycles freed "
+                "buffers into buffer_cache_ until max_pool_size_ (~1.5 × "
+                "max_rec_size ≈ 192 GB on a 128 GB Mac). Sequential "
+                "increasing-size allocations (monotonic KV cache growth "
+                "across long-context requests) can never reuse cached "
+                "buffers — process footprint grows unbounded. Reporter "
+                "observed 108 GB used where 34 GB was expected."
+            ),
+            "mitigation": (
+                "Maintainer closed won't-fix 2026-04-04 (framework-level "
+                "eviction would kill inference perf). Caller-side: "
+                "1) Call `mx.set_cache_limit(N)` at subprocess startup "
+                "sized to the model's working set (2-4× weight bytes) "
+                "instead of the 192 GB default. "
+                "2) Call `mx.clear_cache()` when KV growth crosses a "
+                "threshold (e.g. >64k tokens). "
+                "3) The one-model-per-subprocess pattern in "
+                "`MLXSubprocessRunner` avoids the pool-growth path because "
+                "each subprocess exits entirely between models."
+            ),
+            "scope": "backend:mlx",
+        },
+    ),
+    (
+        "mlx",
+        "<=0.31.2",
+        {
+            "issue": "ml-explore/mlx#3390",
+            "severity": "high",
+            "title": "Metal completion-handler check_error throws → std::terminate → uncatchable SIGABRT",
+            "url": "https://github.com/ml-explore/mlx/issues/3390",
+            "symptom": (
+                "`mlx/backend/metal/eval.cpp::check_error(MTL::CommandBuffer*)` "
+                "throws std::runtime_error when "
+                "`cbuf->status() == CommandBufferStatusError`. Invoked from "
+                "3 sites registered via `addCompletedHandler(...)`, "
+                "executing on Apple's `com.Metal.CompletionQueueDispatch` "
+                "(libdispatch/GCD) queue. libdispatch blocks are not "
+                "exception-safe — throw hits __cxa_throw → std::terminate "
+                "→ abort() → SIGABRT. Python cannot catch this; try/except "
+                "around `mx.eval()` never fires. Duplicate reports: #3224 "
+                "(M3 Ultra 6 hr), #3317 (M2 Ultra asyncio race). Umbrella: "
+                "ml-explore/mlx#2670. This is the 7th kernel-panic "
+                "root-cause class; metal-guard only partially mitigates "
+                "(subprocess isolation keeps parent alive + module-import "
+                "AGX_RELAX stopgap reduces trigger frequency)."
+            ),
+            "mitigation": (
+                "PR #3318 (check_error_deferred pattern) CLOSED without "
+                "merge — maintainer declined on the grounds that process "
+                "state is undefined post-throw. No release targets this "
+                "fix. metal-guard auto-sets `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` "
+                "at module import (reduces GPU watchdog false-positives "
+                "that most commonly trigger the abort). Subprocess "
+                "isolation (MLXSubprocessRunner) mitigates blast radius: "
+                "parent survives, sibling subprocesses unaffected; "
+                "in-flight request is lost. Do NOT attempt a C++ "
+                "terminate handler — state is undefined post-throw."
+            ),
+            "scope": "backend:mlx",
+        },
+    ),
 ]
 
 
@@ -1860,6 +2092,184 @@ def _patch_mlx_lm_1128(*, force: bool) -> bool:
 # reclaimer catch up in almost all cases.
 
 _BENCH_POST_UNLOAD_COOLDOWN_SEC = 8.0
+
+# ---------------------------------------------------------------------------
+# System-level audits (R2 / R3 — 2026-04-15)
+# ---------------------------------------------------------------------------
+#
+# Read-only audits of the runtime host that can be correlated with known
+# kernel-panic patterns. Purely informational — results are logged at
+# startup and exposed via dashboard endpoints; nothing here changes
+# system state.
+
+_WIRED_LIMIT_WARN_RATIO = 0.85
+
+
+def _sysctl(name: str, *, timeout: float = 2.0) -> str | None:
+    """Run ``sysctl -n <name>`` and return stdout stripped, or None on failure."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["sysctl", "-n", name],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.debug("sysctl -n %s failed: %s", name, exc)
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def audit_wired_limit() -> dict[str, Any]:
+    """Audit the ``iogpu.wired_limit_mb`` sysctl for panic-prone values.
+
+    Returns a dict with keys ``limit_mb`` / ``total_gb`` / ``ratio`` /
+    ``mode`` (``"default"`` | ``"override"`` | ``"unknown"``) / ``advisory``.
+
+    Rationale: mlx-lm maintainer ``angeloskath`` commented on issue
+    ``ml-explore/mlx-lm#1047`` that IOGPUFamily kernel panics are often
+    correlated with too-high wired-memory overrides. Values >
+    ``_WIRED_LIMIT_WARN_RATIO`` (85%) of physical memory stress the
+    allocator path implicated in the #3186 panic signature.
+
+    Never raises. Subprocess failures return ``mode="unknown"``.
+    """
+    raw_limit = _sysctl("iogpu.wired_limit_mb")
+    raw_total = _sysctl("hw.memsize")
+
+    limit_mb: int | None = None
+    if raw_limit is not None:
+        try:
+            limit_mb = int(raw_limit)
+        except ValueError:
+            pass
+
+    total_gb: float | None = None
+    if raw_total is not None:
+        try:
+            total_gb = int(raw_total) / (1024 ** 3)
+        except ValueError:
+            pass
+
+    if limit_mb is None or total_gb is None or total_gb <= 0:
+        return {
+            "limit_mb": limit_mb,
+            "total_gb": total_gb,
+            "ratio": 0.0,
+            "mode": "unknown",
+            "advisory": None,
+        }
+
+    if limit_mb == 0:
+        return {
+            "limit_mb": 0,
+            "total_gb": total_gb,
+            "ratio": 0.0,
+            "mode": "default",
+            "advisory": None,
+        }
+
+    ratio = (limit_mb / 1024.0) / total_gb
+    advisory: str | None = None
+    if ratio > _WIRED_LIMIT_WARN_RATIO:
+        advisory = (
+            f"iogpu.wired_limit_mb={limit_mb}MB is {ratio:.0%} of "
+            f"{total_gb:.0f}GB unified memory. Too-high overrides have "
+            f"been correlated with IOGPUFamily kernel panics "
+            f"(mlx-lm#1047 maintainer comment). Consider: "
+            f"sudo sysctl iogpu.wired_limit_mb=0 to return to Apple "
+            f"default, or pick a value < "
+            f"{int(total_gb * _WIRED_LIMIT_WARN_RATIO * 1024)}MB."
+        )
+
+    return {
+        "limit_mb": limit_mb,
+        "total_gb": total_gb,
+        "ratio": ratio,
+        "mode": "override",
+        "advisory": advisory,
+    }
+
+
+def read_gpu_driver_version(*, timeout: float = 3.0) -> str | None:
+    """Return the ``IOGPUFamily`` kext bundle version, or None if unreadable.
+
+    Panic reports on ``ml-explore/mlx#3186`` pin the fault to the
+    ``com.apple.iokit.IOGPUFamily`` kext. Logging the driver revision
+    at startup is useful forensic context for future crash correlation.
+
+    Probes ``kextstat`` first; falls back to
+    ``ioreg -rc IOGPUFamily -d 1`` CFBundleVersion. First non-empty
+    reading wins. Never raises.
+    """
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["kextstat"], capture_output=True, text=True,
+            timeout=timeout, check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.debug("kextstat failed: %s", exc)
+    else:
+        if out.returncode == 0:
+            for line in out.stdout.splitlines():
+                if "com.apple.iokit.IOGPUFamily" not in line:
+                    continue
+                lo, _, _ = line.partition(")")
+                _, _, rhs = lo.rpartition("(")
+                version = rhs.strip()
+                if version:
+                    return version
+
+    try:
+        out = subprocess.run(
+            ["ioreg", "-rc", "IOGPUFamily", "-d", "1"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.debug("ioreg IOGPUFamily failed: %s", exc)
+        return None
+    if out.returncode != 0:
+        return None
+    for line in out.stdout.splitlines():
+        if "CFBundleVersion" not in line:
+            continue
+        _, _, rhs = line.partition("=")
+        value = rhs.strip().strip('"').strip()
+        if value:
+            return value
+    return None
+
+
+def log_system_audit_at_startup() -> dict[str, Any]:
+    """Run all host-level audits and WARNING-log any advisory.
+
+    Returns the combined audit dict. Intended for program entry points
+    (CLI ``main()``, FastAPI lifespan) so operators see host-level
+    stability warnings in routine logs.
+    """
+    wired = audit_wired_limit()
+    kext = read_gpu_driver_version()
+
+    if wired.get("advisory"):
+        log.warning("system audit: %s", wired["advisory"])
+    else:
+        log.info(
+            "system audit: wired_limit mode=%s limit_mb=%s total_gb=%s",
+            wired.get("mode"), wired.get("limit_mb"), wired.get("total_gb"),
+        )
+
+    if kext:
+        log.info("system audit: IOGPUFamily kext version=%s", kext)
+    else:
+        log.debug("system audit: IOGPUFamily kext version unreadable")
+
+    return {
+        "wired_limit": wired,
+        "gpu_driver_version": kext,
+    }
+
 
 # Post-unload active memory above this threshold logs an informational
 # message (not a failure). Metal's lazy page reclaimer only returns
@@ -2161,6 +2571,11 @@ def _worker_main(
     # Suppress TOKENIZERS_PARALLELISM warning in subprocess
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+    # R6 process-mode marker — let detect_process_mode() classify this
+    # child as ``subprocess_worker`` (skip_process_lock=True in defaults,
+    # since the parent already owns the cross-process lock).
+    os.environ["METALGUARD_SUBPROCESS_WORKER"] = "1"
+
     # Install MetalGuard's SIGABRT handler for forensic breadcrumb
     try:
         from metal_guard import metal_guard as _mg
@@ -2286,8 +2701,24 @@ class MLXSubprocessRunner:
         self._parent_recv: Connection | None = None
         self._worker_pid: int | None = None
         self._started = False
+        self._holds_mlx_lock = False
 
-        self._start_worker()
+        # H7 (2026-04-16): acquire the cross-process MLX lock BEFORE
+        # spawning the worker. Without this, any concurrent MLX
+        # acquirer (pytest running bench_scoped_load, a second bench
+        # CLI, an acceptance test) can legally overwrite the lock
+        # mid-run while we are still holding Metal buffers. Two
+        # processes sharing IOGPU = IOGPUMemory.cpp:492 kernel panic.
+        acquire_mlx_lock(f"mlx_subprocess_runner:{self.model_id}")
+        self._holds_mlx_lock = True
+
+        try:
+            self._start_worker()
+        except BaseException:
+            # Worker failed to load / timed out — release the lock so
+            # the next caller is not locked out by a dead runner.
+            self._release_mlx_lock_if_held()
+            raise
 
     def _start_worker(self) -> None:
         """Fork the worker subprocess and wait for 'ready' signal."""
@@ -2435,7 +2866,7 @@ class MLXSubprocessRunner:
         self._cleanup()
 
     def _cleanup(self) -> None:
-        """Close pipes and clear references."""
+        """Close pipes, clear references, and release the MLX lock."""
         for conn in (self._parent_send, self._parent_recv):
             if conn is not None:
                 try:
@@ -2446,6 +2877,24 @@ class MLXSubprocessRunner:
         self._parent_recv = None
         self._process = None
         self._started = False
+        self._release_mlx_lock_if_held()
+
+    def _release_mlx_lock_if_held(self) -> None:
+        """Release the MLX lock if this runner acquired it. Idempotent.
+
+        Best-effort: ``release_mlx_lock`` never raises, so this is safe
+        from ``__del__``, error handlers, and normal cleanup paths.
+        """
+        if not self._holds_mlx_lock:
+            return
+        try:
+            release_mlx_lock()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.warning(
+                "MLXSubprocessRunner: release_mlx_lock failed for %s: %s",
+                self.model_id, exc,
+            )
+        self._holds_mlx_lock = False
 
     @property
     def worker_pid(self) -> int | None:
@@ -2542,3 +2991,585 @@ def shutdown_all_workers() -> None:
         for key, runner in list(_runner_pool.items()):
             runner.shutdown()
         _runner_pool.clear()
+
+
+# ---------------------------------------------------------------------------
+# R4 + R7 — Prefill allocation guard (2026-04-16)
+# ---------------------------------------------------------------------------
+#
+# Single-allocation ceiling guard: for context_tokens × model attention
+# geometry, estimate the peak Metal buffer a prefill pass would need
+# and refuse the load if it risks IOGPUFamily state corruption
+# (mlx#3186 cluster). ``require_fit`` guards model weights;
+# ``require_prefill_fit`` guards the single-pass attention tensor which
+# scales quadratically with context.
+#
+# A 131 k context on a 32-head 4-bit model allocates a score tensor
+# ~55 GB in one dispatch — IOGPUFamily panics even when the device
+# has 60+ GB free. Hard-cap at 5 GB single-allocation by default.
+# ``recommend_chunk_size`` (R7) answers "if a full prefill would blow,
+# what chunk would fit?" via binary search.
+
+
+@dataclass(frozen=True)
+class ModelDims:
+    """Attention geometry needed to estimate prefill peak allocation.
+
+    GQA / MQA aware: ``n_kv_heads ≤ n_heads`` for grouped variants;
+    ``n_kv_heads == n_heads`` for MHA.
+    """
+
+    n_layers: int
+    n_heads: int
+    n_kv_heads: int
+    head_dim: int
+    dtype_bytes: int = 2  # fp16 / bf16 default; 1 for int8, 0.5 for int4
+
+
+# Curated table of popular Apple-Silicon-deployed model dimensions.
+# Not a complete catalog — only well-known shapes likely to appear
+# in real workloads. Users can extend at runtime by inserting into
+# ``KNOWN_MODELS`` or passing dims directly to ``require_prefill_fit``.
+#
+# Sources: HuggingFace model cards + mlx-community repacks (2026-04-16).
+KNOWN_MODELS: dict[str, ModelDims] = {
+    "gemma-4-26b-a4b-it-4bit": ModelDims(n_layers=62, n_heads=16, n_kv_heads=16, head_dim=256),
+    "gemma-4-e2b-it-4bit": ModelDims(n_layers=30, n_heads=8, n_kv_heads=4, head_dim=256),
+    "gemma-4-e4b-it-4bit": ModelDims(n_layers=34, n_heads=16, n_kv_heads=8, head_dim=256),
+    "gemma-4-31b-it-8bit": ModelDims(n_layers=48, n_heads=32, n_kv_heads=16, head_dim=256),
+    "Mistral-Small-3.2-24B": ModelDims(n_layers=56, n_heads=32, n_kv_heads=8, head_dim=128),
+    "pixtral-12b-4bit": ModelDims(n_layers=40, n_heads=32, n_kv_heads=8, head_dim=128),
+    "Hermes-3-Llama-3.1-8B-4bit": ModelDims(n_layers=32, n_heads=32, n_kv_heads=8, head_dim=128),
+    "LFM2-VL-3B-4bit": ModelDims(n_layers=24, n_heads=16, n_kv_heads=16, head_dim=128),
+}
+
+
+def lookup_dims(model_id: str) -> ModelDims | None:
+    """Best-effort lookup by substring — ``mlx-community/<model>`` prefix ok."""
+    basename = model_id.rsplit("/", 1)[-1]
+    if basename in KNOWN_MODELS:
+        return KNOWN_MODELS[basename]
+    for key, dims in KNOWN_MODELS.items():
+        if key in model_id:
+            return dims
+    return None
+
+
+def estimate_prefill_peak_alloc_gb(
+    *, context_tokens: int, dims: ModelDims,
+) -> float:
+    """Estimate peak single-allocation during prefill, in GB.
+
+    Returns the larger of:
+
+    * Per-layer attention score tensor
+      ``n_heads × ctx × ctx × dtype_bytes`` (one fused dispatch)
+    * Whole-model KV cache
+      ``2 × n_layers × n_kv_heads × ctx × head_dim × dtype_bytes``
+
+    Attention scores scale quadratically in context; KV linearly.
+    Scores overtake KV around long contexts on deep models.
+    Either can be what tips IOGPUFamily.
+    """
+    scores_bytes = dims.n_heads * context_tokens * context_tokens * dims.dtype_bytes
+    kv_bytes = (
+        2 * dims.n_layers * dims.n_kv_heads
+        * context_tokens * dims.head_dim * dims.dtype_bytes
+    )
+    return max(scores_bytes, kv_bytes) / 1e9
+
+
+def require_prefill_fit(
+    *,
+    context_tokens: int,
+    dims: ModelDims,
+    available_gb: float,
+    single_alloc_ceiling_gb: float = 5.0,
+    headroom_pct: float = 0.30,
+) -> None:
+    """Raise :class:`MetalOOMError` if a prefill pass risks kernel panic.
+
+    Two fail paths:
+
+    * ``peak > single_alloc_ceiling_gb`` — IOGPUFamily state corruption
+      risk (``ml-explore/mlx#3186`` root cause). Hard cap regardless of
+      total memory available.
+    * ``peak > available_gb × (1 - headroom_pct)`` — not enough headroom
+      for the actual generate pass + KV cache overhead + scratch.
+
+    Never called on an unknown model (``dims`` is required). Caller
+    responsibility to either ``lookup_dims(model_id)`` or pass dims;
+    if dims are unknown, caller should ``log.info`` and skip.
+    """
+    peak = estimate_prefill_peak_alloc_gb(context_tokens=context_tokens, dims=dims)
+
+    if peak > single_alloc_ceiling_gb:
+        raise MetalOOMError(
+            f"Prefill peak alloc {peak:.1f} GB > single-alloc ceiling "
+            f"{single_alloc_ceiling_gb:.1f} GB at context={context_tokens}. "
+            f"IOGPUFamily state corruption risk (mlx#3186). "
+            f"Use recommend_chunk_size() for safe segmentation."
+        )
+
+    threshold = available_gb * (1.0 - headroom_pct)
+    if peak > threshold:
+        raise MetalOOMError(
+            f"Prefill peak alloc {peak:.1f} GB > {threshold:.1f} GB "
+            f"(available {available_gb:.1f} GB × {1 - headroom_pct:.0%} "
+            f"headroom) at context={context_tokens}."
+        )
+
+    log.debug(
+        "require_prefill_fit OK: peak=%.2f GB avail=%.1f GB ctx=%d",
+        peak, available_gb, context_tokens,
+    )
+
+
+def recommend_chunk_size(
+    *,
+    context_tokens: int,
+    dims: ModelDims,
+    single_alloc_ceiling_gb: float = 4.0,
+    min_chunk: int = 512,
+) -> int:
+    """Return a chunk size whose peak alloc estimate fits the ceiling.
+
+    If the full ``context_tokens`` already fits, returns
+    ``context_tokens`` unchanged. Otherwise binary-searches the largest
+    chunk that satisfies ``estimate ≤ ceiling``.
+
+    Purely advisory — metal-guard does not chunk on behalf of the
+    caller. A batched prefill wrapper picks up the recommendation and
+    does its own segmentation.
+
+    Uses a tighter default ceiling (4 GB) than
+    :func:`require_prefill_fit` (5 GB) so post-chunk slack remains for
+    downstream dispatches.
+    """
+    if estimate_prefill_peak_alloc_gb(
+        context_tokens=context_tokens, dims=dims,
+    ) <= single_alloc_ceiling_gb:
+        return context_tokens
+
+    lo, hi = min_chunk, context_tokens
+    while hi - lo > min_chunk:
+        mid = (lo + hi) // 2
+        if estimate_prefill_peak_alloc_gb(
+            context_tokens=mid, dims=dims,
+        ) <= single_alloc_ceiling_gb:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def describe_prefill_plan(
+    *,
+    context_tokens: int,
+    model_id: str | None = None,
+    dims: ModelDims | None = None,
+    available_gb: float | None = None,
+) -> dict[str, Any]:
+    """Dashboard-ready dict summarising prefill safety for a plan.
+
+    Null-safe for unknown models — never raises. Keys::
+
+        model_id / context_tokens / dims_known /
+        peak_alloc_gb / fits_ceiling / fits_headroom /
+        recommended_chunk_size / advisory
+    """
+    resolved_dims = dims
+    if resolved_dims is None and model_id is not None:
+        resolved_dims = lookup_dims(model_id)
+
+    if resolved_dims is None:
+        return {
+            "model_id": model_id,
+            "context_tokens": context_tokens,
+            "dims_known": False,
+            "peak_alloc_gb": None,
+            "fits_ceiling": None,
+            "fits_headroom": None,
+            "recommended_chunk_size": None,
+            "advisory": (
+                "model dims unknown — add to KNOWN_MODELS to enable check"
+            ),
+        }
+
+    peak = estimate_prefill_peak_alloc_gb(
+        context_tokens=context_tokens, dims=resolved_dims,
+    )
+    fits_ceiling = peak <= 5.0
+    fits_headroom: bool | None = None
+    if available_gb is not None:
+        fits_headroom = peak <= available_gb * 0.70
+
+    advisory: str | None = None
+    chunk: int | None = None
+    if not fits_ceiling:
+        chunk = recommend_chunk_size(
+            context_tokens=context_tokens, dims=resolved_dims,
+        )
+        advisory = (
+            f"peak {peak:.1f} GB > 5 GB ceiling — recommend chunk_size={chunk}"
+        )
+    elif fits_headroom is False:
+        advisory = (
+            f"peak {peak:.1f} GB > {available_gb * 0.70:.1f} GB headroom"
+        )
+
+    return {
+        "model_id": model_id,
+        "context_tokens": context_tokens,
+        "dims_known": True,
+        "peak_alloc_gb": round(peak, 3),
+        "fits_ceiling": fits_ceiling,
+        "fits_headroom": fits_headroom,
+        "recommended_chunk_size": chunk,
+        "advisory": advisory,
+    }
+
+
+# ---------------------------------------------------------------------------
+# R5 — Per-request KV cumulative byte tracker (2026-04-16)
+# ---------------------------------------------------------------------------
+#
+# ``MetalGuard.start_kv_cache_monitor`` watches *global* Metal pressure —
+# which is late: a long-running request that steadily grows its KV
+# cache can push the device past the IOGPUFamily threshold while the
+# global metric still looks fine. Per-request tracking catches that
+# specific request early, before the global metric crosses.
+#
+# Caller opts in; no automatic instrumentation. Pattern::
+#
+#     from metal_guard import kv_tracker
+#     kv_tracker.start(request_id, ceiling_gb=10.0)
+#     try:
+#         for token in generate(...):
+#             kv_tracker.add_bytes(request_id, bytes_for_this_step)
+#             yield token
+#     finally:
+#         kv_tracker.finalize(request_id)
+
+
+@dataclass
+class _RequestRecord:
+    """Mutable per-request state for :class:`KVGrowthTracker`."""
+
+    ceiling_bytes: int
+    cumulative_bytes: int = 0
+    step_count: int = 0
+    aborted: bool = False
+
+
+@dataclass
+class KVGrowthTracker:
+    """Thread-safe registry of per-request KV growth.
+
+    Not a singleton by type — callers that want a shared registry use
+    the module-level :data:`kv_tracker`. Tests can construct their own
+    to stay isolated.
+    """
+
+    def __post_init__(self) -> None:
+        self._requests: dict[str, _RequestRecord] = {}
+        self._lock = threading.Lock()
+
+    def start(self, request_id: str, *, ceiling_gb: float = 20.0) -> None:
+        """Begin tracking ``request_id``. Overwrites any stale entry."""
+        if ceiling_gb <= 0:
+            raise ValueError(f"ceiling_gb must be > 0, got {ceiling_gb}")
+        with self._lock:
+            self._requests[request_id] = _RequestRecord(
+                ceiling_bytes=int(ceiling_gb * 1e9),
+            )
+        log.debug("kv_tracker: started %s ceiling=%.1f GB", request_id, ceiling_gb)
+
+    def add_bytes(self, request_id: str, bytes_added: int) -> int:
+        """Record ``bytes_added`` for ``request_id``.
+
+        Returns new cumulative byte count. Raises
+        :class:`MetalOOMError` if cumulative would exceed the ceiling;
+        the record is marked ``aborted`` and future ``add_bytes`` calls
+        re-raise immediately.
+
+        Silently no-ops if ``request_id`` was never ``start``-ed — so
+        opt-in instrumentation does not error out of the generate loop.
+        """
+        if bytes_added < 0:
+            raise ValueError(f"bytes_added must be ≥ 0, got {bytes_added}")
+
+        with self._lock:
+            rec = self._requests.get(request_id)
+            if rec is None:
+                return 0
+            if rec.aborted:
+                self._raise_oom(request_id, rec)
+            rec.cumulative_bytes += bytes_added
+            rec.step_count += 1
+            if rec.cumulative_bytes > rec.ceiling_bytes:
+                rec.aborted = True
+                self._raise_oom(request_id, rec)
+            return rec.cumulative_bytes
+
+    def finalize(self, request_id: str) -> dict[str, Any] | None:
+        """Stop tracking; return the final record as a dict (or None)."""
+        with self._lock:
+            rec = self._requests.pop(request_id, None)
+        if rec is None:
+            return None
+        log.debug(
+            "kv_tracker: finalized %s cumulative=%.2f GB steps=%d aborted=%s",
+            request_id, rec.cumulative_bytes / 1e9, rec.step_count, rec.aborted,
+        )
+        return {
+            "request_id": request_id,
+            "cumulative_gb": round(rec.cumulative_bytes / 1e9, 3),
+            "ceiling_gb": round(rec.ceiling_bytes / 1e9, 3),
+            "step_count": rec.step_count,
+            "aborted": rec.aborted,
+        }
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        """Return currently tracked requests (dashboard helper)."""
+        with self._lock:
+            return [
+                {
+                    "request_id": rid,
+                    "cumulative_gb": round(rec.cumulative_bytes / 1e9, 3),
+                    "ceiling_gb": round(rec.ceiling_bytes / 1e9, 3),
+                    "step_count": rec.step_count,
+                    "aborted": rec.aborted,
+                }
+                for rid, rec in self._requests.items()
+            ]
+
+    @staticmethod
+    def _raise_oom(request_id: str, rec: _RequestRecord) -> None:
+        raise MetalOOMError(
+            f"Request {request_id!r} KV cache "
+            f"{rec.cumulative_bytes / 1e9:.1f} GB > ceiling "
+            f"{rec.ceiling_bytes / 1e9:.1f} GB after {rec.step_count} steps. "
+            f"Aborting to prevent Metal kernel panic."
+        )
+
+
+# Module-level shared instance for most callers.
+kv_tracker = KVGrowthTracker()
+
+
+# ---------------------------------------------------------------------------
+# R6 — Process-mode detection (2026-04-16)
+# ---------------------------------------------------------------------------
+#
+# Different runtime contexts need different MetalGuard defaults:
+#
+# * ``server`` — multi-tenant, short-lived requests, tight budgets.
+#   mlx-lm#883 / #854 clustered panic reports around long-lived server
+#   loops that never flushed between concurrent requests.
+# * ``subprocess_worker`` — spawned by :class:`MLXSubprocessRunner`;
+#   parent already owns the cross-process MLX lock, child must skip.
+# * ``notebook`` — human-driven, relaxed timeouts.
+# * ``cli`` — one-shot script; library defaults.
+# * ``embedded`` — imported by a host application; defaults match server.
+#
+# Detection is heuristic and cheap. Never raises; unknown → ``cli``.
+
+
+ProcessMode = str  # literal: "server" | "embedded" | "notebook" | "cli" | "subprocess_worker"
+
+# Set by MLXSubprocessRunner in the spawned child before it imports
+# metal_guard — opt-in explicit marker is more reliable than grepping
+# sys.argv for process IDs.
+_SUBPROCESS_WORKER_ENV = "METALGUARD_SUBPROCESS_WORKER"
+
+
+def detect_process_mode() -> ProcessMode:
+    """Classify the current process. Called on demand — no caching."""
+    argv = sys.argv if sys.argv else []
+    argv_str = " ".join(argv)
+    argv0 = os.path.basename(argv[0]) if argv else ""
+
+    if os.environ.get(_SUBPROCESS_WORKER_ENV) == "1":
+        return "subprocess_worker"
+
+    if "mlx_lm.server" in argv_str or "mlx.server" in argv_str:
+        return "server"
+
+    if any(
+        token in argv0 or token in argv_str.split()
+        for token in ("uvicorn", "gunicorn", "hypercorn", "fastapi")
+    ):
+        return "server"
+
+    if "ipykernel" in sys.modules or "ipykernel_launcher" in argv_str:
+        return "notebook"
+
+    if "pytest" in argv0 or argv0.endswith("_pytest"):
+        return "cli"
+
+    if argv0.endswith(".py") or argv0 == "python" or argv0.startswith("python"):
+        return "cli"
+
+    return "embedded"
+
+
+_MODE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "server": {
+        "generate_timeout_sec": 60.0,
+        "periodic_flush_interval_sec": 60.0,
+        "kv_ceiling_gb": 10.0,
+        "prefill_single_alloc_ceiling_gb": 4.0,
+    },
+    "embedded": {
+        "generate_timeout_sec": 120.0,
+        "periodic_flush_interval_sec": 120.0,
+        "kv_ceiling_gb": 15.0,
+        "prefill_single_alloc_ceiling_gb": 4.5,
+    },
+    "notebook": {
+        "generate_timeout_sec": 600.0,
+        "periodic_flush_interval_sec": 900.0,
+        "kv_ceiling_gb": 30.0,
+        "prefill_single_alloc_ceiling_gb": 5.0,
+    },
+    "cli": {
+        "generate_timeout_sec": 300.0,
+        "periodic_flush_interval_sec": 300.0,
+        "kv_ceiling_gb": 20.0,
+        "prefill_single_alloc_ceiling_gb": 5.0,
+    },
+    "subprocess_worker": {
+        "generate_timeout_sec": 300.0,
+        "periodic_flush_interval_sec": 300.0,
+        "kv_ceiling_gb": 20.0,
+        "prefill_single_alloc_ceiling_gb": 5.0,
+        # Worker inherits parent's cross-process lock ownership and
+        # must not re-acquire.
+        "skip_process_lock": True,
+    },
+}
+
+
+def apply_mode_defaults(mode: ProcessMode | None = None) -> dict[str, Any]:
+    """Return recommended config dict for ``mode``.
+
+    If ``mode`` is ``None``, detects via :func:`detect_process_mode`.
+    Returned dict is a fresh copy.
+    """
+    resolved = mode if mode is not None else detect_process_mode()
+    defaults = _MODE_DEFAULTS.get(resolved, _MODE_DEFAULTS["cli"])
+    result = dict(defaults)
+    result["mode"] = resolved
+    return result
+
+
+def describe_process_mode() -> dict[str, Any]:
+    """Dashboard-ready summary of current process classification."""
+    mode = detect_process_mode()
+    return {
+        "mode": mode,
+        "argv0": os.path.basename(sys.argv[0]) if sys.argv else "",
+        "has_ipykernel": "ipykernel" in sys.modules,
+        "subprocess_worker_env": os.environ.get(_SUBPROCESS_WORKER_ENV, ""),
+        "defaults": apply_mode_defaults(mode),
+    }
+
+
+# ---------------------------------------------------------------------------
+# R8 — Apple Feedback Assistant panic report formatter (2026-04-16)
+# ---------------------------------------------------------------------------
+#
+# ``ml-explore/mlx#3186`` (FB22091885) is the canonical template Apple
+# accepts for IOGPUFamily kernel panics. This function converts a
+# forensics dict into a ready-to-paste Feedback Assistant report so
+# operators don't hand-stitch it during a reboot recovery. Pure
+# formatting, no I/O.
+
+
+def format_panic_for_apple_feedback(
+    forensics: dict[str, Any],
+    *,
+    include_breadcrumb: bool = True,
+    max_breadcrumb_lines: int = 60,
+) -> str:
+    """Return a multi-line string ready to paste into Feedback Assistant.
+
+    Expected ``forensics`` keys (all optional — missing values render
+    as ``unknown``): ``panic_string``, ``panic_time``, ``hardware``,
+    ``gpu_driver``, ``os_version``, ``kernel_version``, ``mlx_versions``,
+    ``repro_steps``, ``breadcrumbs``, ``advisories``.
+    """
+    hw = forensics.get("hardware", {}) or {}
+    panic = forensics.get("panic_string", "unknown")
+    panic_time = forensics.get("panic_time", "unknown")
+    kext = forensics.get("gpu_driver", "unknown")
+    os_ver = forensics.get("os_version", "unknown")
+    kernel = forensics.get("kernel_version", "unknown")
+    repro = forensics.get("repro_steps", []) or []
+    breadcrumbs = (
+        forensics.get("breadcrumbs", []) or [] if include_breadcrumb else []
+    )
+    advisories = forensics.get("advisories", []) or []
+    mlx_versions = forensics.get("mlx_versions", {}) or {}
+
+    lines: list[str] = []
+    lines.append(f"**PANIC STRING:** {panic}")
+    lines.append(f"**TIME:** {panic_time}")
+    lines.append("")
+
+    lines.append("## System")
+    lines.append(f"- Hardware: {hw.get('chip', 'unknown')} "
+                 f"({hw.get('gpu_memory_gb', '?')} GB unified)")
+    lines.append(f"- macOS: {os_ver}")
+    lines.append(f"- Kernel: {kernel}")
+    lines.append(f"- IOGPUFamily kext: {kext}")
+    if mlx_versions:
+        lines.append("- MLX stack:")
+        for pkg, ver in sorted(mlx_versions.items()):
+            lines.append(f"  - {pkg}: {ver}")
+    lines.append("")
+
+    lines.append("## Reproducer")
+    if repro:
+        for i, step in enumerate(repro, 1):
+            lines.append(f"{i}. {step}")
+    else:
+        lines.append("(No reproducer supplied — see breadcrumb tail below)")
+    lines.append("")
+
+    if advisories:
+        lines.append("## Active advisories at panic time")
+        for a in advisories:
+            sev = a.get("severity", "?")
+            pkg = a.get("package", "?")
+            ver = a.get("installed_version", "?")
+            url = a.get("url", "")
+            title = a.get("title", "")
+            lines.append(f"- [{sev}] {pkg} {ver} — {title} ({url})")
+        lines.append("")
+
+    if include_breadcrumb and breadcrumbs:
+        tail = breadcrumbs[-max_breadcrumb_lines:]
+        lines.append(f"## Breadcrumb tail (last {len(tail)} lines)")
+        lines.append("```")
+        lines.extend(str(b).rstrip() for b in tail)
+        lines.append("```")
+        lines.append("")
+
+    lines.append("## What MetalGuard observed")
+    lines.append("MetalGuard is a Python-side defensive layer for MLX on "
+                 "Apple Silicon. At the time of the panic it was enforcing "
+                 "the defensive-mode MLX process lock, subprocess worker "
+                 "isolation, prefill allocation guard, and per-request KV "
+                 "growth tracking. The panic still occurred despite these "
+                 "guards, which suggests an in-kernel IOGPUFamily state "
+                 "issue rather than a Python-side race.")
+    lines.append("")
+    lines.append("## Related upstream issues")
+    lines.append("- mlx#3186 (canonical IOGPUFamily panic)")
+    lines.append("- mlx#3348 (CommandEncoder thread-local)")
+    lines.append("- mlx#3346 (merged into #3186)")
+    lines.append("- mlx-lm#1047 (wired_limit correlation)")
+
+    return "\n".join(lines)
