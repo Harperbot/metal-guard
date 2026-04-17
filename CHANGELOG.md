@@ -5,6 +5,123 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] — 2026-04-17
+
+Minor release porting **Layer 9 (L9)** from Harper's internal fork
+into the open-source distribution. L9 was written in response to a
+production kernel panic on 2026-04-16 23:33:27 — `IOGPUMemory.cpp:492
+"completeMemory() prepare count underflow"` — that fired during the
+*first* `generate()` after a freshly-loaded subprocess worker. The
+L6 SIGABRT handler could not catch it: the panic lived at kernel
+level, before any user-space signal. The only defence left was to
+stop doing back-to-back loads in the first place.
+
+After 24 hours of real-world exposure, the baseline panic rate on
+Harper's box dropped from ~1.4/day to zero — the first
+panic-free 24 h window in the post-panic sample. L9 is now stable
+enough to ship outside the private fork.
+
+### Added
+
+- **`CadenceGuard`** (L9 primary defence). Per-model load-timestamp
+  store with configurable minimum interval (default **180 s**).
+  Persisted to `~/.cache/metal-guard/cadence.json` via atomic
+  write (`os.replace`), so the mark survives subprocess spawn,
+  process kill, and kernel panic. A worker can check-and-mark in
+  one call via the `require_cadence_clear(model_id)` helper; on
+  violation it raises `CadenceViolation` with `.model_id`,
+  `.last_ts`, `.min_interval`, and `.delta` for structured
+  handling. Stale entries (> 4 h) are GC'd on next mark.
+
+- **`CadenceViolation`** exception. Callers inside the worker
+  subprocess are expected to `sys.exit(2)` on catch so the parent
+  runner propagates it as a normal worker error rather than a
+  mysterious crash.
+
+- **Panic ingest** — `parse_panic_reports(directory, *,
+  since_ts=None)` scans `/Library/Logs/DiagnosticReports/` (and
+  its `Retired/` subdir) for `*.panic` files, classifies each via
+  `detect_panic_signature()`, and returns a list of `dict`
+  records with `ts` / `signature` / `explanation` / `pid` /
+  `source_file`. Timestamp comes from the embedded `Calendar:
+  0x<sec> 0x<usec>` field; falls back to `os.path.getmtime` when
+  absent. **Never raises** — returns `[]` if the directory is
+  unreadable (modern macOS requires admin privileges for
+  `/Library/Logs/DiagnosticReports/`).
+
+- **`ingest_panics_jsonl(*, report_dir=None, jsonl_path=None)`**
+  appends new panic records into a dedupe'd JSONL archive
+  (default `~/.cache/metal-guard/panics.jsonl`). Dedupes by both
+  `source_file` and `(ts_bucket, pid)` event key to handle the
+  macOS quirk where a single panic produces both
+  `.contents.panic` and `panic-full-...` copies. Idempotent:
+  returns the number of new records (0 once caught up).
+  Best-effort writes — panic archival must never itself crash the
+  caller.
+
+- **`CircuitBreaker`** (L9 secondary defence). Reads the JSONL
+  archive and refuses new workers when **≥2 panics within the
+  trailing 1 h** (both thresholds configurable). A trip persists
+  via `~/.cache/metal-guard/breaker.json` so the cooldown survives
+  process restart. `check()` raises `MLXCooldownActive` which
+  carries `panic_count`, `window_sec`, `cooldown_until`, and
+  `remaining_sec` so the caller can surface an HTTP 503 / task
+  decline / CLI exit rather than retry-and-panic. `status()`
+  returns a dashboard-safe snapshot; `clear()` is the operator
+  override.
+
+- **`detect_panic_signature(text)`** classifies a kernel-panic log
+  snippet into one of four signatures:
+  `prepare_count_underflow` (IOGPUMemory.cpp:492 — mlx-lm#883 /
+  #1015), `pending_memory_set` (IOGPUGroupMemory.cpp:219 —
+  mlx#3346), `ctxstore_timeout` (mlx#3267), and a `metal_oom`
+  fallback. Returns `(None, None)` for panics that do not match
+  any known MLX-related signature — callers can route those to a
+  generic bucket.
+
+- **`kv_cache_clear_on_pressure(available_gb,
+  growth_rate_gb_per_min)`** — ready-made callback for
+  `MetalGuard.start_kv_cache_monitor(on_pressure=...)`. Calls
+  `mx.clear_cache()` and logs the trigger. No-op when MLX is not
+  importable.
+
+- **`MetalGuard.detect_hardware()`** now also returns
+  `gpu_driver_version` (the IOGPUFamily kext bundle version read
+  via `kextstat`/`ioreg`). Panic reports on mlx#3186 pin the
+  fault to this specific kext, so recording the driver revision
+  at startup adds forensic context for future crash correlation.
+  Value is `None` if the kext reader fails.
+
+### Tests
+
+- 31 new tests under `tests/test_l9_*.py` covering CadenceGuard
+  (8), CircuitBreaker (9), panic ingest (8), and signature
+  detection (6). Full suite: **157 passed** (126 existing + 31
+  new) on Python 3.14.
+
+### Rationale
+
+v0.7.1 closed the prefill-allocation gap (R4 auto-wired into
+`_worker_main`). But a workload that stayed under the R4 ceiling
+could still panic if it loaded a new model while the previous
+one's IOGPU accounting hadn't fully drained. The Harper panic on
+2026-04-16 reproduced exactly that path: two 4-bit loads within
+~40 s. L9 enforces ≥180 s cadence per-model and trips a 1 h
+cooldown after any 2-panic cluster in a rolling hour. Empirically
+this window catches catastrophic clusters without punishing the
+steady-state background rate.
+
+### Path defaults
+
+Open-source defaults use `~/.cache/metal-guard/` for all L9
+artifacts:
+
+- `~/.cache/metal-guard/cadence.json` — CadenceGuard timestamps
+- `~/.cache/metal-guard/panics.jsonl` — panic archive
+- `~/.cache/metal-guard/breaker.json` — CircuitBreaker state
+
+All three are overridable via constructor / keyword arguments.
+
 ## [0.7.1] — 2026-04-16
 
 Patch release wiring R4 (`require_prefill_fit`) into the actual call

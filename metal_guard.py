@@ -81,7 +81,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -109,6 +109,84 @@ _METAL_OOM_PATTERN = re.compile(
     r"|ImpactingInteractivity",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+# Kernel-panic classifier.  Maps a human-readable signature name to the
+# regex that fingerprints it in `kernel.log` / `log show` output after a
+# reboot.  Used by `detect_panic_signature()` so incidents can be tagged
+# and triaged rather than lumped together as "panic".
+#
+# Each entry is keyed by signature name → (regex, short explanation).
+# Regexes are case-insensitive and matched with DOTALL so multi-line
+# panic backtraces work.
+_KERNEL_PANIC_SIGNATURES: dict[str, tuple[re.Pattern[str], str]] = {
+    # mlx-lm#883 / #1015 — the original panic reported in summer 2025.
+    # Underflow when Metal's IOGPUMemory prepare count drops below zero
+    # because a command buffer was released before its dependent ops
+    # finished. MetalGuard mitigates via cooldown + thread tracking.
+    "prepare_count_underflow": (
+        re.compile(
+            r"completeMemory\(\)\s*prepare\s*count\s*underflow",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "IOGPUMemory.cpp:492 — command buffer released before Metal "
+        "finished. Reproduces under back-to-back load/unload cycles.",
+    ),
+    # mlx#3346 @yoyaku155 — second panic signature (IOGPUGroupMemory.cpp:219).
+    # Lingering entries in the pending-memory set when a new command
+    # buffer is submitted. Typically triggered by rapid model swaps
+    # without sufficient cooldown.
+    "pending_memory_set": (
+        re.compile(
+            r"fPendingMemorySet"
+            r"|IOGPUGroupMemory\.cpp:219",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "IOGPUGroupMemory.cpp:219 — pending memory set not drained "
+        "before reuse. Mitigation: longer post-unload cooldown.",
+    ),
+    # mlx#3267 @zcbenz — command-buffer context store timeout on long
+    # GPU workloads. Partial fix is AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1
+    # (set above at import time).
+    "ctxstore_timeout": (
+        re.compile(
+            r"IOGPUCommandQueue.*context\s*store\s*timeout",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "AGX command-buffer context store timeout. MetalGuard sets "
+        "AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1 at import.",
+    ),
+    # Generic OOM / command buffer execution failure from the C++ layer.
+    # Falls through here if none of the more specific patterns match but
+    # the panic still talks about IOGPU + OOM wording.
+    "metal_oom": (
+        re.compile(
+            r"kIOGPUCommandBufferCallbackErrorOutOfMemory"
+            r"|Command\s+buffer\s+execution\s+failed.*Insufficient\s+Memory",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "Metal OOM at command-buffer callback. Raise headroom or "
+        "reduce active model footprint.",
+    ),
+}
+
+
+def detect_panic_signature(text: str) -> tuple[str | None, str | None]:
+    """Classify a kernel-panic log snippet into a known signature.
+
+    Args:
+        text: Raw text from ``log show --predicate 'eventMessage CONTAINS "panic"'``,
+            ``sudo dmesg``, or the contents of ``/Library/Logs/DiagnosticReports/*.panic``.
+
+    Returns:
+        ``(signature_name, explanation)`` — or ``(None, None)`` if no known
+        pattern matched. Callers can route unknown panics to a catch-all
+        bucket.
+    """
+    for name, (pattern, explanation) in _KERNEL_PANIC_SIGNATURES.items():
+        if pattern.search(text):
+            return name, explanation
+    return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +248,43 @@ class MetalOOMError(RuntimeError):
     def __init__(self, message: str, stats: MemoryStats | None = None):
         super().__init__(message)
         self.stats = stats
+
+
+# ---------------------------------------------------------------------------
+# KV cache pressure helpers
+# ---------------------------------------------------------------------------
+
+def kv_cache_clear_on_pressure(
+    available_gb: float,
+    growth_rate_gb_per_min: float,
+) -> None:
+    """Default ``on_pressure`` callback for :meth:`MetalGuard.start_kv_cache_monitor`.
+
+    Clears MLX's cache when headroom is low or growth is too fast. Safe
+    to pass directly::
+
+        metal_guard.start_kv_cache_monitor(
+            on_pressure=kv_cache_clear_on_pressure,
+        )
+
+    Does NOT evict application-level KV caches (those are held by the
+    caller's server process — only it can invalidate them). This only
+    asks Metal to return as much unused GPU memory as possible.
+    """
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+
+    log.warning(
+        "KV pressure callback firing: avail=%.1fGB growth=%.2fGB/min — "
+        "calling mx.clear_cache()",
+        available_gb, growth_rate_gb_per_min,
+    )
+    try:
+        mx.clear_cache()
+    except Exception as exc:
+        log.error("mx.clear_cache() from pressure callback failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -289,11 +404,24 @@ class MetalGuard:
         else:
             tier = "high"
 
+        # IOGPUFamily kext version. mlx#3186 pins the panic fault to
+        # this specific kext, so recording the driver revision gives
+        # forensic context for future crash correlation. Never raises
+        # — returns None on any failure. Forward reference is fine;
+        # the function is module-level and resolved lazily at call
+        # time.
+        gpu_driver_version: str | None = None
+        try:
+            gpu_driver_version = read_gpu_driver_version()
+        except Exception as exc:  # pragma: no cover — defensive
+            log.debug("read_gpu_driver_version failed: %s", exc)
+
         return {
             "gpu_memory_gb": round(gpu_memory_gb, 1),
             "chip": chip,
             "recommended_working_set_gb": round(recommended_gb, 1),
             "tier": tier,
+            "gpu_driver_version": gpu_driver_version,
         }
 
     @classmethod
@@ -3622,3 +3750,461 @@ def format_panic_for_apple_feedback(
     lines.append("- mlx-lm#1047 (wired_limit correlation)")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# L9 — Cadence Guard (2026-04-16)
+#
+# Eighth-hole patch. Production kernel panic at 2026-04-16 23:33:27 was
+# IOGPUMemory.cpp:492 "completeMemory() prepare count underflow" during
+# the first generate() after a freshly-loaded subprocess worker — i.e.
+# the SIGABRT handler was installed (L6) but the panic happened at
+# kernel level before any user-space signal could fire. Root-cause
+# matches the Apple backend log note: "Reproduces under back-to-back
+# load/unload cycles". Only way to avoid it is to not do back-to-back
+# loads.
+# ---------------------------------------------------------------------------
+
+
+class CadenceViolation(RuntimeError):
+    """Raised when a back-to-back MLX load would risk IOGPU underflow."""
+
+    def __init__(self, model_id: str, last_ts: float, min_interval: float) -> None:
+        self.model_id = model_id
+        self.last_ts = last_ts
+        self.min_interval = min_interval
+        self.delta = max(0.0, time.time() - last_ts)
+        super().__init__(
+            f"CadenceGuard blocked load of {model_id!r}: last cycle "
+            f"{self.delta:.1f}s ago < min_interval {min_interval:.0f}s"
+        )
+
+
+_CADENCE_PATH_DEFAULT = os.path.expanduser("~/.cache/metal-guard/cadence.json")
+_CADENCE_FILE_LOCK = threading.Lock()
+_CADENCE_MAX_AGE_SEC = 14400.0  # GC entries older than 4h — far past any min_interval
+
+
+class CadenceGuard:
+    """Per-model load timestamp store + min-interval enforcement.
+
+    Persisted to JSON on disk so timestamps survive subprocess spawn and
+    kernel panics. Cross-process safe via atomic write (``os.replace``).
+
+    Typical use (inside the worker subprocess, right before
+    ``mlx_lm.load``)::
+
+        from metal_guard import require_cadence_clear, CadenceViolation
+        try:
+            require_cadence_clear(model_id)
+        except CadenceViolation:
+            # Exit cleanly — the parent will propagate as a worker error
+            sys.exit(2)
+    """
+
+    def __init__(
+        self,
+        path: str | None = None,
+        *,
+        min_interval_sec: float = 180.0,
+    ) -> None:
+        # Resolve default at call time so test monkeypatches of the
+        # module-level constant take effect.
+        self._path = os.path.expanduser(path or _CADENCE_PATH_DEFAULT)
+        self._min_interval = float(min_interval_sec)
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    @property
+    def min_interval_sec(self) -> float:
+        return self._min_interval
+
+    def _read(self) -> dict[str, float]:
+        try:
+            with open(self._path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        result: dict[str, float] = {}
+        for k, v in data.items():
+            if isinstance(v, (int, float)):
+                result[str(k)] = float(v)
+        return result
+
+    def _write(self, data: dict[str, float]) -> None:
+        dirname = os.path.dirname(self._path)
+        if dirname:
+            try:
+                os.makedirs(dirname, exist_ok=True)
+            except OSError:
+                return
+        tmp = f"{self._path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, sort_keys=True)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            log.debug("CadenceGuard write failed: %s", exc)
+
+    def _gc_stale(self, data: dict[str, float], now: float) -> dict[str, float]:
+        return {k: v for k, v in data.items() if now - v < _CADENCE_MAX_AGE_SEC}
+
+    def last_ts(self, model_id: str) -> float | None:
+        with _CADENCE_FILE_LOCK:
+            return self._read().get(model_id)
+
+    def mark_load(self, model_id: str, *, ts: float | None = None) -> None:
+        now = ts if ts is not None else time.time()
+        with _CADENCE_FILE_LOCK:
+            data = self._gc_stale(self._read(), now)
+            data[model_id] = now
+            self._write(data)
+
+    def check(self, model_id: str) -> None:
+        """Raise CadenceViolation if the model was loaded within min_interval."""
+        last = self.last_ts(model_id)
+        if last is None:
+            return
+        if time.time() - last < self._min_interval:
+            raise CadenceViolation(model_id, last, self._min_interval)
+
+
+def require_cadence_clear(
+    model_id: str,
+    *,
+    min_interval_sec: float = 180.0,
+    guard: CadenceGuard | None = None,
+) -> None:
+    """Check + mark atomic helper.
+
+    Checks cadence; on pass, marks the load timestamp (so the NEXT call
+    within ``min_interval`` will be blocked, including retries after a
+    kernel panic since the mark is persisted to disk before the crash).
+    """
+    cg = guard if guard is not None else CadenceGuard(min_interval_sec=min_interval_sec)
+    cg.check(model_id)
+    cg.mark_load(model_id)
+
+
+# ---------------------------------------------------------------------------
+# L9 — Panic Report Ingest (2026-04-16)
+# ---------------------------------------------------------------------------
+
+_PANIC_REPORT_DIR = "/Library/Logs/DiagnosticReports"
+_PANIC_JSONL_PATH = os.path.expanduser("~/.cache/metal-guard/panics.jsonl")
+_PANIC_CALENDAR_RE = re.compile(r"Calendar:\s*0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)")
+_PANIC_PID_RE = re.compile(r"pid\s+(\d+):\s*\S+")
+_PANIC_FILE_MAX_READ = 200_000  # chars — panic files can be 500k+, only need header + signatures
+
+
+def _parse_panic_timestamp(text: str) -> float | None:
+    """Extract ``Calendar: 0x<sec> 0x<usec>`` as float seconds-since-epoch."""
+    m = _PANIC_CALENDAR_RE.search(text)
+    if not m:
+        return None
+    try:
+        sec = int(m.group(1), 16)
+        usec = int(m.group(2), 16)
+        return float(sec) + usec / 1_000_000.0
+    except ValueError:
+        return None
+
+
+def _parse_panic_pid(text: str) -> int | None:
+    m = _PANIC_PID_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def parse_panic_reports(
+    directory: str | None = None,
+    *,
+    since_ts: float | None = None,
+) -> list[dict[str, Any]]:
+    """Scan ``*.panic`` files and classify them.
+
+    Silently returns ``[]`` if the directory is unreadable (common —
+    admin permissions required on modern macOS for
+    ``/Library/Logs/DiagnosticReports``). Callers are expected to also
+    look at backend-side / application panic text when available.
+    """
+    directory = directory or _PANIC_REPORT_DIR
+    results: list[dict[str, Any]] = []
+
+    # Scan both the top-level directory and its ``Retired/`` subdir.
+    # macOS moves older panic reports into ``Retired/`` after a few days;
+    # missing it means the archive never sees panics more than ~48h old.
+    scan_dirs = [directory, os.path.join(directory, "Retired")]
+    scanned: set[str] = set()
+
+    for scan_dir in scan_dirs:
+        if scan_dir in scanned:
+            continue
+        scanned.add(scan_dir)
+        try:
+            entries = sorted(os.listdir(scan_dir))
+        except OSError:
+            continue
+
+        for name in entries:
+            if not name.endswith(".panic"):
+                continue
+            path = os.path.join(scan_dir, name)
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as fh:
+                    text = fh.read(_PANIC_FILE_MAX_READ)
+            except OSError:
+                continue
+
+            ts = _parse_panic_timestamp(text)
+            if ts is None:
+                try:
+                    ts = os.path.getmtime(path)
+                except OSError:
+                    continue
+            if since_ts is not None and ts < since_ts:
+                continue
+
+            signature, explanation = detect_panic_signature(text)
+            results.append({
+                "ts": ts,
+                "signature": signature or "unknown",
+                "explanation": explanation,
+                "pid": _parse_panic_pid(text),
+                "source_file": path,
+            })
+    return results
+
+
+def ingest_panics_jsonl(
+    *,
+    report_dir: str | None = None,
+    jsonl_path: str | None = None,
+) -> int:
+    """Append any new panic records to the JSONL archive.
+
+    Dedupes by ``source_file`` **and** ``(ts_bucket, pid)`` event key.
+    Idempotent: repeated calls append zero new records once the archive
+    catches up. Returns number of new records written. Never raises —
+    best-effort; panic archival must never itself crash the caller.
+    """
+    report_dir = report_dir or _PANIC_REPORT_DIR
+    jsonl_path = os.path.expanduser(jsonl_path or _PANIC_JSONL_PATH)
+    seen_paths: set[str] = set()
+    seen_events: set[tuple[int, int | None]] = set()
+
+    def _event_key(rec: dict[str, Any]) -> tuple[int, int | None]:
+        """Deduplicate across multiple DiagnosticReports copies of the same
+        panic (macOS writes both ``.contents.panic`` and
+        ``panic-full-...`` for the most recent event — both parse to the
+        same ts+pid).
+        """
+        ts = rec.get("ts")
+        pid = rec.get("pid")
+        ts_bucket = int(ts) if isinstance(ts, (int, float)) else 0
+        return (ts_bucket, pid if isinstance(pid, int) else None)
+
+    try:
+        with open(jsonl_path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                src = rec.get("source_file")
+                if isinstance(src, str):
+                    seen_paths.add(src)
+                seen_events.add(_event_key(rec))
+    except OSError:
+        pass
+
+    new_records: list[dict[str, Any]] = []
+    for rec in parse_panic_reports(report_dir):
+        if rec.get("source_file") in seen_paths:
+            continue
+        key = _event_key(rec)
+        if key in seen_events:
+            continue
+        seen_events.add(key)
+        new_records.append(rec)
+    if not new_records:
+        return 0
+
+    dirname = os.path.dirname(jsonl_path)
+    if dirname:
+        try:
+            os.makedirs(dirname, exist_ok=True)
+        except OSError:
+            pass
+
+    try:
+        with open(jsonl_path, "a", encoding="utf-8") as fh:
+            for rec in new_records:
+                fh.write(json.dumps(rec, sort_keys=True))
+                fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        log.warning("ingest_panics_jsonl: write failed path=%s err=%s", jsonl_path, exc)
+        return 0
+
+    return len(new_records)
+
+
+# ---------------------------------------------------------------------------
+# L9 — Circuit Breaker (2026-04-16)
+# ---------------------------------------------------------------------------
+
+
+class MLXCooldownActive(RuntimeError):
+    """Raised when MetalGuard refuses to spawn a worker during a cooldown.
+
+    Callers should surface this (HTTP 503, task runner decline, CLI
+    exit) rather than silently fall through — the kernel is in a bad
+    state and another load is likely to panic the machine again.
+    """
+
+    def __init__(self, panic_count: int, window_sec: float, cooldown_until: float) -> None:
+        self.panic_count = panic_count
+        self.window_sec = window_sec
+        self.cooldown_until = cooldown_until
+        self.remaining_sec = max(0.0, cooldown_until - time.time())
+        super().__init__(
+            f"MLX cooldown active — {panic_count} panics in last "
+            f"{window_sec / 3600:.0f}h. Retry in {self.remaining_sec:.0f}s "
+            f"(until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(cooldown_until))})."
+        )
+
+
+_BREAKER_STATE_PATH = os.path.expanduser("~/.cache/metal-guard/breaker.json")
+
+
+class CircuitBreaker:
+    """Refuse new MLX workers after repeated panics within a rolling window.
+
+    Default policy: ≥2 kernel panics within **1h** → 1h cooldown. Tuned
+    around the empirical observation that CadenceGuard (L9 sibling)
+    already enforces ≥180s between same-model loads — so two panics
+    within a single hour means cadence guard failed AND the kernel's
+    IOGPU accounting is compromised. A wider window (e.g. 24h) was
+    tried first but tripped chronically on a machine that averages
+    ~1.4 panics/day over a week: over-defensive to the point of
+    blocking all MLX work. The 1h window catches catastrophic
+    clusters without punishing the steady-state background rate.
+
+    Humans should still reboot + investigate after any cooldown trip.
+    """
+
+    def __init__(
+        self,
+        *,
+        jsonl_path: str | None = None,
+        state_path: str | None = None,
+        window_sec: float = 3600,
+        panic_threshold: int = 2,
+        cooldown_sec: float = 3600,
+    ) -> None:
+        self._jsonl_path = os.path.expanduser(jsonl_path or _PANIC_JSONL_PATH)
+        self._state_path = os.path.expanduser(state_path or _BREAKER_STATE_PATH)
+        self._window = float(window_sec)
+        self._threshold = int(panic_threshold)
+        self._cooldown = float(cooldown_sec)
+
+    def _load_state(self) -> dict[str, Any]:
+        try:
+            with open(self._state_path, encoding="utf-8") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_state(self, data: dict[str, Any]) -> None:
+        dirname = os.path.dirname(self._state_path)
+        if dirname:
+            try:
+                os.makedirs(dirname, exist_ok=True)
+            except OSError:
+                return
+        tmp = f"{self._state_path}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._state_path)
+        except OSError as exc:
+            log.debug("CircuitBreaker save_state failed: %s", exc)
+
+    def _recent_panic_count(self, now: float) -> int:
+        cutoff = now - self._window
+        count = 0
+        try:
+            with open(self._jsonl_path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = rec.get("ts") if isinstance(rec, dict) else None
+                    if isinstance(ts, (int, float)) and ts >= cutoff:
+                        count += 1
+        except OSError:
+            return 0
+        return count
+
+    def check(self, *, now: float | None = None) -> None:
+        """Raise MLXCooldownActive if the breaker is currently tripped."""
+        current = now if now is not None else time.time()
+        state = self._load_state()
+        cooldown_until = state.get("cooldown_until")
+        if isinstance(cooldown_until, (int, float)) and cooldown_until > current:
+            raise MLXCooldownActive(
+                int(state.get("panic_count", self._threshold)),
+                self._window,
+                float(cooldown_until),
+            )
+
+        count = self._recent_panic_count(current)
+        if count >= self._threshold:
+            until = current + self._cooldown
+            self._save_state({
+                "cooldown_until": until,
+                "panic_count": count,
+                "entered_at": current,
+                "window_sec": self._window,
+                "threshold": self._threshold,
+            })
+            raise MLXCooldownActive(count, self._window, until)
+
+    def clear(self) -> None:
+        """Operator override — remove the current cooldown state."""
+        try:
+            os.remove(self._state_path)
+        except OSError:
+            pass
+
+    def status(self, *, now: float | None = None) -> dict[str, Any]:
+        current = now if now is not None else time.time()
+        state = self._load_state()
+        cooldown_until = state.get("cooldown_until")
+        in_cooldown = isinstance(cooldown_until, (int, float)) and cooldown_until > current
+        return {
+            "in_cooldown": bool(in_cooldown),
+            "cooldown_until": float(cooldown_until) if in_cooldown else None,
+            "cooldown_remaining_sec": max(0.0, float(cooldown_until) - current) if in_cooldown else 0.0,
+            "panic_threshold": self._threshold,
+            "window_sec": self._window,
+            "recent_panic_count": self._recent_panic_count(current),
+        }
