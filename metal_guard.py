@@ -4208,3 +4208,120 @@ class CircuitBreaker:
             "window_sec": self._window,
             "recent_panic_count": self._recent_panic_count(current),
         }
+
+
+# ---------------------------------------------------------------------------
+# B2 — subprocess_inference_guard (per-inference Metal flush)
+# ---------------------------------------------------------------------------
+#
+# Background: if you use subprocess isolation for MLX inference (a common
+# pattern to contain C++ crashes — see L7 in Harper's internal fork), the
+# worker process runs ``gen_fn(...)`` in its own address space. Parent-
+# process hooks such as ``mx.clear_cache()`` or post-generate
+# ``mx.eval(result)`` do NOT reach the subprocess. Empirically this
+# reproduces the ``IOGPUMemory.cpp:492 "completeMemory() prepare count
+# underflow"`` kernel panic: the GPU command buffer is still in flight
+# when the subprocess releases its memory, and Metal accounting drifts
+# until the next load trips an underflow → kernel panic.
+#
+# See upstream reports:
+#   - mlx-lm: ml-explore/mlx-lm#1128  (prefill guard design)
+#   - mlx:    ml-explore/mlx#3186     (subprocess isolation guidance)
+#   - mlx:    ml-explore/mlx#3346     (kernel panic reproducers)
+#
+# Fix: wrap every ``gen_fn`` call in the worker with this guard. Order:
+#
+#   PRE  — mx.clear_cache()          release prior iter's cached buffers
+#   body — generate runs
+#   POST — mx.synchronize()          block until GPU command buffer drained
+#   POST — mx.clear_cache()          release this iter's buffers
+#
+# ``mx.synchronize()`` is chosen over ``mx.eval(result)`` because generate
+# return types vary (``str`` for mlx-lm, ``GenerateResult`` for mlx-vlm).
+# ``synchronize`` is return-type agnostic and semantically correct: wait
+# for all pending GPU ops to complete.
+#
+# This API is a pure addition — no breaking changes. It is useful to any
+# project doing subprocess-based MLX isolation; Harper's internal B1 fix
+# ended a streak of 6 panics in 3 days after wiring this into the worker.
+@contextmanager
+def subprocess_inference_guard(model_id: str) -> Generator[None, None, None]:
+    """Per-inference Metal flush for subprocess workers.
+
+    Wrap each ``gen_fn(...)`` call inside your subprocess worker::
+
+        from metal_guard import subprocess_inference_guard
+
+        with subprocess_inference_guard(model_id):
+            result = gen_fn(model, processor, prompt=..., ...)
+
+    The guard is best-effort: if ``mlx.core`` cannot be imported (test
+    environment without MLX) the context manager no-ops. PRE hook
+    failures do NOT block the body — a broken guard is worse than no
+    guard because it would silently stop all inference. POST hook
+    failures are logged but never mask a body exception.
+
+    Args:
+        model_id: model identifier used only for breadcrumb forensics.
+            A post-mortem of a kernel panic can grep the breadcrumb log
+            for ``SUBPROC_PRE`` / ``SUBPROC_POST`` entries to confirm
+            whether the guard was engaged on the fatal call.
+    """
+    try:
+        import mlx.core as mx
+    except ImportError:
+        yield
+        return
+    except Exception as exc:
+        log.warning(
+            "subprocess_inference_guard: mlx.core import failed (%s); "
+            "guard disabled for %s", exc, model_id,
+        )
+        yield
+        return
+
+    # PRE: release any cached buffers from the previous iteration before
+    # starting the new generate. Best-effort — a failure here must not
+    # block the body (see docstring rationale).
+    try:
+        mx.clear_cache()
+    except Exception as exc:
+        log.warning(
+            "subprocess_inference_guard PRE clear_cache failed for %s: %s",
+            model_id, exc,
+        )
+    try:
+        metal_guard.breadcrumb(f"SUBPROC_PRE: {model_id}")
+    except Exception as exc:
+        log.debug(
+            "subprocess_inference_guard PRE breadcrumb failed for %s: %s",
+            model_id, exc,
+        )
+
+    try:
+        yield
+    finally:
+        # POST: synchronize FIRST so the command buffer is fully drained
+        # before we release the cache. Reversing this order reproduces
+        # the IOGPUMemory.cpp:492 underflow this guard exists to prevent.
+        try:
+            mx.synchronize()
+        except Exception as exc:
+            log.warning(
+                "subprocess_inference_guard POST synchronize failed for %s: %s",
+                model_id, exc,
+            )
+        try:
+            mx.clear_cache()
+        except Exception as exc:
+            log.warning(
+                "subprocess_inference_guard POST clear_cache failed for %s: %s",
+                model_id, exc,
+            )
+        try:
+            metal_guard.breadcrumb(f"SUBPROC_POST: {model_id}")
+        except Exception as exc:
+            log.debug(
+                "subprocess_inference_guard POST breadcrumb failed for %s: %s",
+                model_id, exc,
+            )

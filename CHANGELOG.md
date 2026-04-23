@@ -5,6 +5,76 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] — 2026-04-23
+
+Patch release adding **`subprocess_inference_guard`** — a per-inference
+Metal flush contextmanager for users who run MLX in subprocess isolation.
+
+### Added
+
+- **`metal_guard.subprocess_inference_guard(model_id)`** — module-level
+  contextmanager that wraps every `gen_fn(...)` call inside an MLX
+  subprocess worker. Performs `mx.clear_cache()` PRE, `mx.synchronize()`
+  POST, `mx.clear_cache()` POST, and emits `SUBPROC_PRE` / `SUBPROC_POST`
+  breadcrumbs for post-mortem forensics.
+
+### Fixed
+
+- **`prepare_count_underflow` panics under subprocess isolation.**
+  Harper's internal fork recorded **6 consecutive
+  `IOGPUMemory.cpp:492 "completeMemory() prepare count underflow"`
+  kernel panics in 3 days** (2026-04-20 → 2026-04-23) while running
+  MAGI consensus via subprocess-isolated workers. Root cause: parent-
+  process Metal Guard hooks do not reach subprocess memory — the worker
+  returned from `gen_fn(...)` with in-flight GPU work still pending, the
+  pipe-send / idle-wait released command-buffer references, and Metal's
+  IOGPU driver hit an underflow. `subprocess_inference_guard` restores
+  per-inference flush parity with the in-process path.
+
+### Design notes
+
+- `mx.synchronize()` chosen over `mx.eval(result)` because the generate
+  return type varies by backend (`str` for mlx-lm, `GenerateResult` for
+  mlx-vlm). `synchronize` is return-type agnostic and semantically means
+  "wait for pending GPU ops to complete."
+- POST order is `synchronize` **then** `clear_cache` — reversing
+  reproduces the exact underflow this guard exists to prevent.
+- All hooks are best-effort with structured `logging.warning` on failure
+  — a broken guard is worse than no guard because it would silently
+  halt all inference.
+- `ImportError` on `mlx.core` → guard becomes a no-op contextmanager, so
+  test environments without MLX keep passing.
+
+### Tests
+
+- 9 new tests in `tests/test_subprocess_inference_guard.py` covering
+  call order, synchronize-before-clear ordering, exception safety in
+  `finally`, import-degrade, PRE/POST hook independence, breadcrumb
+  emission, and model_id escape safety.
+
+### Usage
+
+```python
+from metal_guard import subprocess_inference_guard
+
+# Inside your subprocess worker's generate loop:
+with subprocess_inference_guard(model_id):
+    result = gen_fn(model, processor, prompt=..., max_tokens=...)
+```
+
+Applies to any subprocess-isolated MLX worker pattern (e.g.,
+`multiprocessing.Process` + `multiprocessing.Pipe`, but the primitive
+is wrapper-agnostic).
+
+### Migration
+
+- Pure addition, zero breaking changes.
+- Does **not** replace `CadenceGuard` (L9) — they solve different
+  failure modes (back-to-back loads vs. in-flight command buffers) and
+  are complementary.
+
+---
+
 ## [0.8.0] — 2026-04-17
 
 Minor release porting **Layer 9 (L9)** from Harper's internal fork
