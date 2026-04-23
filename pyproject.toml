@@ -25,6 +25,7 @@ classifiers = [
 
 [project.optional-dependencies]
 mlx = ["mlx>=0.20"]
+test = ["pytest>=7.0"]
 
 [project.urls]
 Repository = "https://github.com/harper-systems/metal-guard"

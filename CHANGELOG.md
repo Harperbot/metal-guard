@@ -29,7 +29,29 @@ Metal flush contextmanager for users who run MLX in subprocess isolation.
   returned from `gen_fn(...)` with in-flight GPU work still pending, the
   pipe-send / idle-wait released command-buffer references, and Metal's
   IOGPU driver hit an underflow. `subprocess_inference_guard` restores
-  per-inference flush parity with the in-process path.
+  per-inference flush parity with the in-process path. The 6-panic
+  streak ended on the first `gen_fn` invocation after B1 was wired in.
+
+### Upstream references
+
+The underlying IOGPU driver bug is an Apple kernel issue, not specific
+to any Python library. Upstream tracking issues (all open at time of
+release, with `zcbenz` and maintainers having acknowledged the
+kernel-level nature):
+
+- [`ml-explore/mlx#3186`](https://github.com/ml-explore/mlx/issues/3186)
+  — subprocess isolation guidance; baseline containment pattern.
+- [`ml-explore/mlx#3346`](https://github.com/ml-explore/mlx/issues/3346)
+  — kernel panic reproducer catalogue.
+- [`ml-explore/mlx-lm#883`](https://github.com/ml-explore/mlx-lm/issues/883)
+  — subprocess worker panic report.
+
+**metal-guard does not fix the driver bug** — it cannot, the bug is
+below user space. What `subprocess_inference_guard` does is narrow the
+race window inside the worker so the in-flight command buffer is
+drained *before* Python releases its buffer references on context
+exit, making the underflow trigger statistically unreachable on the
+workloads we've exercised. The right long-term fix is Apple's.
 
 ### Design notes
 

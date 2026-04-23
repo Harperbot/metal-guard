@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Primary job: library must pass tests on plain Python without MLX installed.
+  # All code paths degrade gracefully when `mlx.core` is unimportable, so this
+  # matrix is the honest portability signal. Covers Python 3.11 / 3.12 / 3.13
+  # on both Linux and macOS.
+  test-without-mlx:
+    name: test (no-mlx, py${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install metal-guard (no MLX extra)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]" || python -m pip install -e . pytest
+
+      - name: Import smoke test
+        run: python -c "import metal_guard; print(metal_guard.__name__)"
+
+      - name: Run pytest
+        run: python -m pytest tests/ -q
+
+  # Apple Silicon job: install the [mlx] extra and run the real MLX-backed
+  # paths. MLX only ships wheels for Apple Silicon, so this is macos-14+
+  # (arm64 runner) only. Allowed to fail on runner unavailability — Linux
+  # matrix is the gating signal.
+  test-with-mlx:
+    name: test (with-mlx, py${{ matrix.python }}, macos-14)
+    runs-on: macos-14
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install metal-guard with MLX extra
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[mlx]" pytest
+
+      - name: Confirm MLX installed
+        run: python -c "import mlx.core as mx; print('mlx', mx.__version__)"
+
+      - name: Run pytest
+        run: python -m pytest tests/ -q
+
+  lint:
+    name: lint (ruff, advisory)
+    runs-on: ubuntu-latest
+    # Lint is advisory during the 0.8.x series — code passed tests on the
+    # private fork before ruff rules were tightened. Will be promoted to
+    # blocking once legacy lint debt is cleared.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: python -m pip install ruff
+
+      - name: Ruff syntax check (pyflakes subset)
+        run: ruff check --select E9,F63,F7,F82 .
