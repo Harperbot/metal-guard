@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metal-guard"
-version = "0.8.0"
+version = "0.9.0"
 description = "GPU safety layer for MLX on Apple Silicon — prevents kernel panics from Metal driver bugs"
 readme = "README.md"
 license = "MIT"
@@ -25,6 +25,7 @@ classifiers = [
 
 [project.optional-dependencies]
 mlx = ["mlx>=0.20"]
+test = ["pytest>=7.0"]
 
 [project.urls]
 Repository = "https://github.com/harper-systems/metal-guard"

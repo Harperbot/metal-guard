@@ -6,7 +6,7 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version:** v0.8.0 — see [CHANGELOG.md](CHANGELOG.md) for release history and per-feature rationale.
+**Current version:** v0.9.0 — see [CHANGELOG.md](CHANGELOG.md) for release history and per-feature rationale. v0.9.0 adds `subprocess_inference_guard` (B1), cross-model cadence + gemma-4 90-second floor (C5), `gemma4_generation_flush` (C7), and the `KNOWN_PANIC_MODELS` advisory registry.
 
 ## Landed here searching for one of these? You're in the right place.
 
@@ -307,6 +307,61 @@ The breadcrumb log defaults to `logs/metal_breadcrumb.log` (relative); override 
 - Mac Studio M1 Ultra (64 GB) — 9 kernel panics before MetalGuard, 24 h panic-free after L9 landed
 - 10-person batch pipeline: ~90 model load/unload cycles, 994 s, zero crashes
 - Models: Mistral-Small-3.2-24B, Phi-4-mini, Gemma-4-26B / 31B, Pixtral-12B, LFM2-VL-3B (4-bit and 8-bit)
+
+## Known affected models (v0.9.0, 2026-04)
+
+Some models have a race window wide enough that MetalGuard narrows it but does not close it. When that happens we record the model here so you can make an informed decision before loading it in production.
+
+### `mlx-community/gemma-4-31b-it-8bit` — repeat offender
+
+Two production kernel panics on Harper's Mac Studio, **24 hours apart, same pipeline, same model**, same panic signature `IOGPUMemory.cpp:492 "completeMemory() prepare count underflow"`:
+
+| #   | Local time       | PID   | Spawn → panic | Context                                            |
+|-----|------------------|-------|--------------:|----------------------------------------------------|
+|  7  | 2026-04-23 03:14 | 67840 |        ~6 min | rezivot pipeline, no cross-model cadence wired yet |
+| 11  | 2026-04-24 03:14 | 26608 |      ~1.5 min | same pipeline as #7; ~1.5 min worker-ready to panic despite classic L9 defences in place |
+
+Community corroboration (all 2026-04):
+
+- [Hannecke — "MLX Crashed My Mac" (Medium)](https://medium.com/@michael.hannecke/how-my-local-coding-agent-crashed-my-mac-and-what-i-learned-about-mlx-memory-management-e0cbad01553c) — M4 Max 64 GB, same signature; pivoted to `Qwen3-Coder-30B-A3B` MoE.
+- [`lmstudio-ai/lmstudio-bug-tracker#1740`](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1740) "Gemma-4 31b KV excessive KV cache footprint" — confirms the hybrid-attention KV explosion: 26 GB VRAM for 8192 context; hybrid attention (50 sliding + 10 global) KV cache plus 8-bit weights (~34 GB) plus full-context KV pushes a 64 GB Mac over the edge.
+- [`ml-explore/mlx-lm#883`](https://github.com/ml-explore/mlx-lm/issues/883) — M3 Ultra 96 GB, same signature.
+- [`ml-explore/mlx#3186` (comment, 2026-04-24)](https://github.com/ml-explore/mlx/issues/3186#issuecomment-4314204974) — independent third-party data point: Mac mini M4 base 32 GB, macOS 26.4.1 (`25E253`), mlx 0.31.2, `mlx-community/Qwen3.6-35B-A3B-4bit`. Panic 8 min 16 s after `mlx_lm.server` start; `--prompt-cache-bytes 8 GiB` did not prevent it; the reporter adopted `llama.cpp` for production serving. Explicitly references this project's "two-trigger-path hypothesis."
+
+**Bottom line.** macOS 26.4.x has not fixed the bug. macOS 26.5 beta has not fixed the bug. Adding RAM to 96 GB did not prevent it. MetalGuard v0.9.0 narrows the race windows (cross-model cadence, gemma-4 90-second floor, first-generate flush, subprocess inference guard) but does not eliminate panic on this model in Harper's workload.
+
+You can query the advisory programmatically:
+
+```python
+from metal_guard import check_known_panic_model, warn_if_known_panic_model
+
+advisory = check_known_panic_model(model_id)
+if advisory is not None:
+    # Decide: refuse load, switch backend, or proceed with explicit ack.
+    ...
+
+# Or fire-and-forget: idempotent, emits one log.warning per process per model.
+warn_if_known_panic_model(model_id)
+```
+
+## When MetalGuard is not enough
+
+If you engage every v0.9.0 defence (B1 + C5 + C7 + CircuitBreaker) and still observe repeat panics on the same model, that is a signal that the race window is wider than a userspace layer can narrow. Two escape hatches, in order of ROI:
+
+1. **Switch backend.** [Ollama](https://ollama.com/) and [`llama.cpp`](https://github.com/ggml-org/llama.cpp) both use Metal MPS under the hood but run a persistent worker architecture that sidesteps the subprocess teardown race entirely. Harper's `harper-finance` project migrated to Ollama on 2026-04-23 and has run zero-panic since. The independent M4-base reporter on [`mlx#3186`](https://github.com/ml-explore/mlx/issues/3186#issuecomment-4314204974) made the same call for production serving. You lose some raw throughput (MLX was measured 30–55 % faster on prefill in that report); you gain "doesn't panic the machine."
+
+2. **Pivot to a different model family.** Mixture-of-Experts (MoE) variants — e.g. [`mlx-community/gemma-4-26b-a4b-it-4bit`](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit), `Qwen3-Coder-30B-A3B` — have a much smaller active-parameter footprint per forward pass and a narrower KV growth trajectory. Community reports (Hannecke, lmstudio#1740) converge on MoE as the most reliable same-ecosystem workaround.
+
+MetalGuard is **complementary to both escape hatches** — `subprocess_inference_guard` is useful even under Ollama if you spawn per-request subprocess workers, and `CadenceGuard` still helps regardless of backend when you hot-swap models.
+
+### One hard-learned SOP note
+
+Panic #10 in our timeline (see [CHANGELOG](CHANGELOG.md)) was triggered by an *interactive* `python -c "import sentence_transformers"` on the host terminal — a version-verification command, not any production MLX workload. Anything that imports `torch`, `mlx`, `mlx_lm`, `mlx_vlm`, `sentence_transformers`, `transformers`, `diffusers`, or `accelerate` initialises the Metal MPS backend and can walk into the same kernel bug at process exit. During an active panic cooldown, prefer:
+
+- `pip show <pkg>` for version info, or
+- `python -c "import importlib.metadata as m; print(m.version('<pkg>'))"` which does not cascade-import the package.
+
+**Never** run `python -c "import <ml-package>; print(<ml-package>.__version__)"` while a cooldown is active.
 
 ## Limitations — this is a workaround, not a fix
 

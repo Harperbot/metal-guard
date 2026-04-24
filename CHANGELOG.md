@@ -5,6 +5,255 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] — 2026-04-25
+
+Minor release consolidating **panic #7–#11 findings** from Harper's
+production timeline (2026-04-16 → 2026-04-24) into the open-source
+distribution. Brings three new defences (B1 subprocess guard, C5
+cross-model cadence, C7 gemma-4 first-generate flush) and one new
+piece of advisory data: `KNOWN_PANIC_MODELS`.
+
+**The honest caveat upfront.** metal-guard v0.9.0 narrows multiple race
+windows around the Apple IOGPU driver bug. It reduces panic frequency
+on every workload we've exercised. It **does not eliminate panic**
+on every model — specifically, `mlx-community/gemma-4-31b-it-8bit`
+still panicked on a production pipeline at Harper after every defence
+in this release was engaged (panic #11, 2026-04-24). When metal-guard
+is engaged and a model continues to panic in production, the right
+operational answer is to **switch backend** (Ollama / llama.cpp) or
+**pivot to a different model family** — see "When metal-guard is not
+enough" below.
+
+### Added
+
+- **`subprocess_inference_guard(model_id)` (B1).** Module-level
+  contextmanager that wraps every `gen_fn(...)` call inside an MLX
+  subprocess worker. Performs `mx.clear_cache()` PRE,
+  `mx.synchronize()` POST, `mx.clear_cache()` POST, and emits
+  `SUBPROC_PRE` / `SUBPROC_POST` breadcrumbs. Harper recorded 6
+  consecutive subprocess-path kernel panics in 3 days (2026-04-20 →
+  2026-04-23) before this guard; the streak ended on the first
+  `gen_fn` invocation after it was wired in.
+
+- **Cross-model cadence in `CadenceGuard` (C5).** Reject back-to-back
+  loads of *different* models within a configurable window.
+  `CadenceGuard(cross_model_interval_sec=…)` opts in; the default is
+  `0.0` (disabled) to preserve v0.8.0 semantics. Env var
+  `METALGUARD_CROSS_MODEL_INTERVAL` sets a process-wide default
+  (resolver helper: `_resolve_cross_model_interval`). Violations raise
+  `CrossModelCadenceViolation`, a subclass of `CadenceViolation` so
+  existing `except CadenceViolation` keeps working.
+
+- **Gemma-4 90-second floor (C5).** `mlx-community/gemma-4-*`,
+  `unsloth/gemma-4-*`, and `mlx-models/gemma-4-*` always enforce a
+  minimum 90 s cross-model cadence regardless of configured base.
+  Constant: `GEMMA4_MIN_CROSS_MODEL_INTERVAL_SEC = 90.0`. All 8/8
+  kernel panics in Harper's 2026-04 timeline with an identifiable
+  at-panic model were in the gemma-4 family; panic #6 landed 66 s
+  after prior unload, so 90 s = 66 s + ~36 % safety margin.
+
+- **`gemma4_generation_flush(model_id, generate_call_count)` (C7).**
+  First-generate settle window: `mx.synchronize()` +
+  `mx.clear_cache()` + `time.sleep(3.0)` before the *first*
+  `generate()` on a freshly-loaded gemma-4 worker. No-op on
+  subsequent calls and on non-gemma-4 models. Env overrides:
+  `METALGUARD_GEMMA4_FIRSTGEN_DISABLED=1`,
+  `METALGUARD_GEMMA4_FIRSTGEN_SLEEP_SEC=<seconds>`. Harper's empirical
+  breakdown: 7 of 8 gemma-4 panics landed on the first `generate()`
+  within 7–66 s of worker-ready; the pre-existing flush barriers
+  caught none of them.
+
+  **Renamed from the internal `gemma4_firstgen_guard`** — the name
+  "guard" incorrectly suggested a block. This function is a flush +
+  settle window, not a gate. If you need to gate, use
+  `CircuitBreaker` or `require_cadence_clear`.
+
+- **`KNOWN_PANIC_MODELS` advisory registry.** Module-level dict mapping
+  model IDs to structured advisories (`panic_signature`,
+  `reproductions`, `community`, `recommendation`, `upstream`).
+  Companion helpers:
+    - `check_known_panic_model(model_id) -> dict | None`
+    - `warn_if_known_panic_model(model_id) -> bool` (idempotent; emits
+      one `log.warning` per process per model)
+
+  Policy is the caller's — metal-guard does not refuse loads on its
+  own. v0.9.0 ships with one entry: `mlx-community/gemma-4-31b-it-8bit`.
+
+- **`require_cadence_clear(..., cross_model_interval_sec=...)`.** New
+  keyword argument mirrors the `CadenceGuard` constructor param.
+  `None` (default) delegates to `_resolve_cross_model_interval` which
+  reads `METALGUARD_CROSS_MODEL_INTERVAL` or falls back to the C5
+  default of 60 s. `0.0` disables. When `guard=` is supplied, the
+  guard's own `cross_model_interval_sec` wins.
+
+### Known affected models
+
+#### `mlx-community/gemma-4-31b-it-8bit` — repeat offender
+
+Two production kernel panics on Harper's box, 24 hours apart, same
+model, same pipeline, same panic signature:
+
+| #   | Date/time (local)  | PID   | Spawn → panic | Context                                  |
+|-----|--------------------|-------|--------------:|-------------------------------------------|
+| 7   | 2026-04-23 03:14   | 67840 |        ~6 min | rezivot pipeline, pre-C5                   |
+| 11  | 2026-04-24 03:14   | 26608 |      ~1.5 min | same pipeline as #7; post-C5 but ~1.5 min to panic anyway |
+
+Signature for both: `IOGPUMemory.cpp:492 "completeMemory() prepare
+count underflow"`, Gen-4 hybrid attention, no concurrent generates.
+
+**Community corroboration (all 2026-04):**
+
+- [Hannecke — "MLX Crashed My Mac"](https://medium.com/@michael.hannecke/how-my-local-coding-agent-crashed-my-mac-and-what-i-learned-about-mlx-memory-management-e0cbad01553c)
+  — M4 Max 64 GB, same panic signature, pivoted to
+  `Qwen3-Coder-30B-A3B` MoE as workaround.
+- [`lmstudio-ai/lmstudio-bug-tracker#1740`](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1740)
+  "Gemma-4 31b KV excessive KV cache footprint" — corroborates hybrid
+  attention (50 sliding + 10 global) KV cache + 8-bit weights (~34 GB)
+  + full context KV (20 GB+) > 54 GB memory pressure on the 64 GB
+  class. The thread documents 26 GB VRAM for a mere 8192 context.
+- [`ml-explore/mlx-lm#883`](https://github.com/ml-explore/mlx-lm/issues/883)
+  — M3 Ultra 96 GB reports the same panic signature on the same model
+  family.
+- [`ml-explore/mlx#3186` (comment 2026-04-24)](https://github.com/ml-explore/mlx/issues/3186#issuecomment-4314204974)
+  — independent third-party data point: Mac mini M4 base 32 GB,
+  macOS 26.4.1 (`25E253`), mlx 0.31.2, mlx-lm 0.31.3, model
+  `mlx-community/Qwen3.6-35B-A3B-4bit`. Panic 8 min 16 s after
+  `mlx_lm.server` start; `--prompt-cache-bytes 8 GiB` did not
+  prevent it; reporter adopted `llama.cpp` for production serving.
+
+**What this means in practice.** macOS 26.4.x has not fixed the bug.
+26.5 beta has not fixed the bug. `--prompt-cache-bytes` does not
+prevent it. Adding RAM to 96 GB does not prevent it. metal-guard
+v0.9.0 narrows the race windows but does not eliminate panic on this
+specific model in Harper's workload.
+
+### When metal-guard is not enough
+
+If you engage every defence in v0.9.0 (B1 + C5 + C7 + CircuitBreaker)
+and still observe repeat panics on the same model, that is a signal
+that the race window on that model is wider than metal-guard can
+narrow. Two escape hatches, in order of ROI:
+
+1. **Switch backend.** Ollama and `llama.cpp` both use Metal MPS
+   under the hood but run a persistent worker architecture that
+   avoids the subprocess teardown race entirely. Harper's
+   `harper-finance` project migrated to Ollama 2026-04-23 and has
+   run zero-panic since. The independent `mlx#3186` M4-base
+   reporter adopted `llama.cpp` for the same reason. You lose some
+   raw throughput (MLX was measured 30–55 % faster on prefill in
+   that report); you gain "doesn't panic the machine."
+
+2. **Pivot to a different model family.** Mixture-of-Experts
+   variants (e.g. `mlx-community/gemma-4-26b-a4b-it-4bit`,
+   `Qwen3-Coder-30B-A3B`) have a much smaller active-parameter
+   footprint per forward pass and a narrower KV growth trajectory.
+   Community reports (Hannecke, lmstudio#1740) converge on MoE as
+   the most reliable same-ecosystem workaround.
+
+metal-guard is complementary to both — `subprocess_inference_guard`
+is useful even under Ollama if you spawn per-request subprocess
+workers, and `CadenceGuard` still helps regardless of backend when
+you hot-swap models.
+
+### Panic timeline (Harper internal, 2026-04)
+
+For calibration on what "engaged every defence" means in practice:
+
+| #   | Date (local) | Signature                                 | Trigger                                                  | Defence landed       |
+|-----|--------------|-------------------------------------------|----------------------------------------------------------|----------------------|
+|  7  | 2026-04-23 03:14 | `IOGPUMemory.cpp:492 prepare_count_underflow` | cross-model cadence not wired; gemma-4-31b-8bit | C5 phase-1 shipped |
+|  8  | 2026-04-23 14:07 | `IOGPUMemory.cpp:492`                     | GC / Metal async race across subprocess teardown          | 0.8.6 hotfix 4-barrier |
+|  9  | 2026-04-23 17:40 | `IOGPUMemory.cpp:492`                     | Phase-2 +833-line regression                             | reverted via `git stash` |
+| 10  | 2026-04-23 19:46 | `IOGPUMemory.cpp:492`                     | interactive `python -c "import sentence_transformers"` for version verification → `torch` MPS backend init → process exit race → same Apple kernel bug | ad-hoc import SOP + `mlx-safe-python` wrapper |
+| 11  | 2026-04-24 03:14 | `IOGPUMemory.cpp:492`                     | same pipeline as #7; panic ~1.5 min after worker ready despite classic L9 in place | C7 flush + gemma-4 floor (this release) |
+
+Panic #10 is worth calling out: it was triggered by a *verification*
+command on the host terminal, not by any MLX workload in production.
+Anything that imports `torch`, `mlx`, `mlx_lm`, `mlx_vlm`,
+`sentence_transformers`, `transformers`, `diffusers`, or
+`accelerate` initialises the Metal MPS backend and can walk into the
+same kernel bug at process exit. If your team uses metal-guard, the
+operational lesson is: during an active cooldown, verify package
+versions with `pip show <pkg>` or
+`python -c "import importlib.metadata as m; print(m.version('<pkg>'))"`
+— *never* `python -c "import <ml-pkg>; print(<ml-pkg>.__version__)"`.
+
+### Fixed
+
+- `prepare_count_underflow` panics on subprocess-isolated MLX workers
+  (via B1 `subprocess_inference_guard`) — see v0.8.1 history above.
+- `prepare_count_underflow` panics on back-to-back loads of *different*
+  models within seconds of each other — classic `CadenceViolation`
+  only caught same-model patterns; `CrossModelCadenceViolation`
+  extends coverage to the cross-model axis that Harper's panic #7
+  exposed.
+- First-generate race window on gemma-4 family — `gemma4_generation_flush`
+  inserts a mandatory synchronize + clear + sleep before the first
+  forward pass, extending the settle window the four pre-existing
+  flush barriers failed to cover.
+
+### Changed
+
+- `CadenceGuard.__init__` accepts a new keyword-only argument
+  `cross_model_interval_sec` (default `0.0`, backwards-compat).
+  Property `cadence_guard.cross_model_interval_sec` exposes the
+  configured value.
+- `require_cadence_clear` accepts a new keyword-only argument
+  `cross_model_interval_sec`. Behaviour for existing calls is
+  unchanged unless the env var `METALGUARD_CROSS_MODEL_INTERVAL` is
+  set.
+
+### Migration
+
+- **Pure additions on the public API surface.** Existing v0.8.0 code
+  continues to work without changes.
+- **Env-var opt-in.** If you want cross-model cadence without code
+  changes, set `METALGUARD_CROSS_MODEL_INTERVAL=60` in your
+  environment and call `require_cadence_clear()` as before.
+- **Gemma-4 users get the 90-second floor automatically** the moment
+  `cross_model_interval_sec > 0.0` (or the env var is set). This
+  cannot be opted out of for the gemma-4 family by setting the base
+  to 0 — the floor fires regardless. This is the one intentional
+  asymmetry in the release and reflects the empirical panic data.
+
+### Tests
+
+- 38 new tests in `tests/test_v090_cross_model_cadence.py` covering
+  `_is_gemma4_family` (13 parametrised cases),
+  `_resolve_cross_model_interval` (6 cases: default / env / explicit
+  / invalid-fallback / negative-clamp / zero-disable),
+  `CrossModelCadenceViolation` inheritance + fields,
+  `CadenceGuard` cross-model check (same-model priority, zero-disabled
+  fallthrough, zero-still-floors-gemma4, pass-after-interval),
+  `require_cadence_clear` param plumbing,
+  `gemma4_generation_flush` (non-gemma / count>0 / env-disabled /
+  sleep-env-override / invalid-sleep-env-fallback),
+  `KNOWN_PANIC_MODELS` hit/miss + `warn_if_known_panic_model`
+  idempotence. Full suite: **204 passed** (166 pre-existing + 38
+  new).
+
+### Upstream references
+
+Open upstream issues consistent with the v0.9.0 advisory content, all
+open at release time:
+
+- [`ml-explore/mlx#3186`](https://github.com/ml-explore/mlx/issues/3186)
+  — canonical subprocess isolation / `prepare_count_underflow` thread.
+  Third-party corroboration (2026-04-24, M4 base 32 GB, Qwen3.6-35B-A3B):
+  [`comment 4314204974`](https://github.com/ml-explore/mlx/issues/3186#issuecomment-4314204974).
+- [`ml-explore/mlx#3346`](https://github.com/ml-explore/mlx/issues/3346)
+  — kernel panic reproducer catalogue.
+- [`ml-explore/mlx-lm#883`](https://github.com/ml-explore/mlx-lm/issues/883)
+  — subprocess worker panic report (Hannecke, M4 Max 64 GB).
+- [`ml-explore/mlx-lm#1047`](https://github.com/ml-explore/mlx-lm/issues/1047)
+  — Kimi K2.5 KV cache OOM on M3 Ultra.
+- [`ml-explore/mlx/#3267`](https://github.com/ml-explore/mlx/issues/3267)
+  — GPU watchdog kills MLX when display is active (wontfix). Used to
+  justify the `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` import-time workaround
+  kept from v0.2.x.
+
+---
+
 ## [0.8.0] — 2026-04-17
 
 Minor release porting **Layer 9 (L9)** from Harper's internal fork
