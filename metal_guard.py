@@ -81,7 +81,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -3780,9 +3780,84 @@ class CadenceViolation(RuntimeError):
         )
 
 
+class CrossModelCadenceViolation(CadenceViolation):
+    """Raised when loading a *different* model too soon after another.
+
+    Added v0.9.0 (2026-04-25). Harper's panic timeline (8 IOGPU kernel
+    panics between 2026-04-16 and 2026-04-24, see CHANGELOG) showed that
+    back-to-back loads of **different** models trigger the same
+    ``IOGPUMemory.cpp:492 prepare_count_underflow`` panic as back-to-back
+    same-model loads. The classic same-model ``min_interval`` check let
+    these through because every ``model_id`` was different.
+
+    Inherits from :class:`CadenceViolation` so ``except CadenceViolation``
+    still catches both variants.
+    """
+
+    def __init__(
+        self,
+        model_id: str,
+        last_model: str,
+        last_ts: float,
+        cross_model_interval: float,
+    ) -> None:
+        self.last_model = last_model
+        self.cross_model_interval = cross_model_interval
+        super().__init__(model_id, last_ts, cross_model_interval)
+        self.args = (
+            f"CadenceGuard blocked cross-model load of {model_id!r}: "
+            f"last load was {last_model!r} {self.delta:.1f}s ago "
+            f"< cross_model_interval {cross_model_interval:.0f}s",
+        )
+
+
 _CADENCE_PATH_DEFAULT = os.path.expanduser("~/.cache/metal-guard/cadence.json")
 _CADENCE_FILE_LOCK = threading.Lock()
 _CADENCE_MAX_AGE_SEC = 14400.0  # GC entries older than 4h — far past any min_interval
+
+# --- Cross-model cadence (v0.9.0, C5 phase-1, 2026-04-25) ------------------
+# Non-gemma-4 baseline cadence between loads of *different* models. Set to 0
+# to disable. Env var ``METALGUARD_CROSS_MODEL_INTERVAL`` overrides default.
+_CROSS_MODEL_ENV_VAR = "METALGUARD_CROSS_MODEL_INTERVAL"
+_C5_DEFAULT_CROSS_MODEL_INTERVAL_SEC = 60.0
+
+# Gemma-4 family floor (v0.9.0, C5+C7, 2026-04-25). 8/8 IOGPUMemory.cpp:492
+# panics in Harper's timeline had at-panic model in the gemma-4 family; panic
+# #6 landed 66s after prior unload, so 90s = 66s + ~36% safety margin. Floor
+# applies regardless of configured base (users who set cross_model_interval=0
+# still get this minimum for gemma-4).
+GEMMA4_MIN_CROSS_MODEL_INTERVAL_SEC = 90.0
+
+# Size-anchored regex for gemma-4 family match. Anchors prevent false-positive
+# matches on ``gemma-4b-*`` (4 billion, not Gen4) or ``google/gemma-4-*`` (not
+# a real model) while admitting both standard and MoE variants:
+#   mlx-community/gemma-4-26b-a4b-it-4bit
+#   mlx-community/gemma-4-31b-it-8bit
+#   mlx-community/gemma-4-e4b-it-4bit
+#   unsloth/gemma-4-31b-it-UD-MLX-4bit
+_GEMMA4_NAME_PATTERN = re.compile(
+    r"^gemma-4-(?:\d+b|e\d+b)-"    # size-anchored: digits+b or e+digit+b
+    r"[a-z0-9\-]*"                 # variant tail
+    r"$",
+    re.IGNORECASE,
+)
+_GEMMA4_VENDOR_ALLOWLIST = frozenset({"mlx-community", "unsloth", "mlx-models"})
+
+
+def _is_gemma4_family(model_id: str) -> bool:
+    """Return True for known gemma-4 family model identifiers.
+
+    Vendor allowlist + size-anchored basename match. Used by
+    :class:`CadenceGuard` to enforce the 90s floor on cross-model cadence
+    and by :func:`gemma4_generation_flush` to decide whether to insert a
+    first-generate settle window.
+    """
+    if not model_id or "/" not in model_id:
+        return False
+    vendor, _, name = model_id.lower().partition("/")
+    if vendor not in _GEMMA4_VENDOR_ALLOWLIST:
+        return False
+    return bool(_GEMMA4_NAME_PATTERN.match(name))
 
 
 class CadenceGuard:
@@ -3807,11 +3882,17 @@ class CadenceGuard:
         path: str | None = None,
         *,
         min_interval_sec: float = 180.0,
+        cross_model_interval_sec: float = 0.0,
     ) -> None:
         # Resolve default at call time so test monkeypatches of the
         # module-level constant take effect.
         self._path = os.path.expanduser(path or _CADENCE_PATH_DEFAULT)
         self._min_interval = float(min_interval_sec)
+        # Zero disables the check (backwards-compat default). Non-zero means
+        # reject any load of a *different* model_id within this many seconds
+        # of the most-recent load. gemma-4 family is always floored at
+        # GEMMA4_MIN_CROSS_MODEL_INTERVAL_SEC regardless of this value.
+        self._cross_model_interval = max(0.0, float(cross_model_interval_sec))
 
     @property
     def path(self) -> str:
@@ -3820,6 +3901,21 @@ class CadenceGuard:
     @property
     def min_interval_sec(self) -> float:
         return self._min_interval
+
+    @property
+    def cross_model_interval_sec(self) -> float:
+        return self._cross_model_interval
+
+    def _effective_cross_model_interval(self, model_id: str) -> float:
+        """Return effective cross-model cadence for target model.
+
+        Gemma-4 family floor is ``GEMMA4_MIN_CROSS_MODEL_INTERVAL_SEC``
+        regardless of the configured base (see class docstring for why).
+        """
+        base = self._cross_model_interval
+        if _is_gemma4_family(model_id):
+            return max(base, GEMMA4_MIN_CROSS_MODEL_INTERVAL_SEC)
+        return base
 
     def _read(self) -> dict[str, float]:
         try:
@@ -3867,18 +3963,70 @@ class CadenceGuard:
             self._write(data)
 
     def check(self, model_id: str) -> None:
-        """Raise CadenceViolation if the model was loaded within min_interval."""
-        last = self.last_ts(model_id)
-        if last is None:
-            return
-        if time.time() - last < self._min_interval:
+        """Raise CadenceViolation / CrossModelCadenceViolation if unsafe.
+
+        Two independent checks (same-model has priority):
+
+        1. ``min_interval_sec`` — same ``model_id`` within that window.
+        2. cross-model interval — any *different* ``model_id`` within
+           ``_effective_cross_model_interval(model_id)``. gemma-4 family
+           enforces a 90s floor regardless of configured base.
+        """
+        with _CADENCE_FILE_LOCK:
+            data = self._read()
+        now = time.time()
+        # 1. Same-model back-to-back (classic L9).
+        last = data.get(model_id)
+        if last is not None and now - last < self._min_interval:
             raise CadenceViolation(model_id, last, self._min_interval)
+        # 2. Cross-model back-to-back (v0.9.0 C5).
+        effective_cross = self._effective_cross_model_interval(model_id)
+        if effective_cross > 0.0:
+            most_recent_other: tuple[str, float] | None = None
+            for other_id, other_ts in data.items():
+                if other_id == model_id:
+                    continue
+                if most_recent_other is None or other_ts > most_recent_other[1]:
+                    most_recent_other = (other_id, other_ts)
+            if most_recent_other is not None:
+                other_id, other_ts = most_recent_other
+                if now - other_ts < effective_cross:
+                    raise CrossModelCadenceViolation(
+                        model_id, other_id, other_ts, effective_cross,
+                    )
+
+
+def _resolve_cross_model_interval(explicit: float | None) -> float:
+    """Explicit arg wins; else env var; else default.
+
+    Resolution order:
+
+    1. Explicit ``explicit`` argument (including ``0.0`` to disable).
+    2. ``METALGUARD_CROSS_MODEL_INTERVAL`` environment variable.
+    3. ``_C5_DEFAULT_CROSS_MODEL_INTERVAL_SEC`` (60s).
+
+    Invalid env var values fall back to the default with a warning.
+    """
+    if explicit is not None:
+        return max(0.0, float(explicit))
+    raw = os.getenv(_CROSS_MODEL_ENV_VAR, "").strip()
+    if not raw:
+        return _C5_DEFAULT_CROSS_MODEL_INTERVAL_SEC
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        log.warning(
+            "Invalid %s=%r, falling back to default %.0fs",
+            _CROSS_MODEL_ENV_VAR, raw, _C5_DEFAULT_CROSS_MODEL_INTERVAL_SEC,
+        )
+        return _C5_DEFAULT_CROSS_MODEL_INTERVAL_SEC
 
 
 def require_cadence_clear(
     model_id: str,
     *,
     min_interval_sec: float = 180.0,
+    cross_model_interval_sec: float = 0.0,
     guard: CadenceGuard | None = None,
 ) -> None:
     """Check + mark atomic helper.
@@ -3886,10 +4034,66 @@ def require_cadence_clear(
     Checks cadence; on pass, marks the load timestamp (so the NEXT call
     within ``min_interval`` will be blocked, including retries after a
     kernel panic since the mark is persisted to disk before the crash).
+
+    v0.9.0 additions:
+
+    - ``cross_model_interval_sec`` (new): seconds required between loads
+      of *different* models. Default is ``0.0`` (disabled) to preserve
+      backwards-compatibility with v0.8.x callers. To opt in globally
+      without code changes, set ``METALGUARD_CROSS_MODEL_INTERVAL=<sec>``
+      in the environment; the CadenceGuard this helper creates will read
+      that env value. Explicit ``cross_model_interval_sec`` argument
+      takes priority over the env var when non-zero; pass ``0.0`` (or
+      omit) to defer to the env var. Ignored when ``guard`` is supplied
+      (the guard's own ``cross_model_interval_sec`` wins).
+    - Raises :class:`CrossModelCadenceViolation` (subclass of
+      :class:`CadenceViolation`) when a cross-model violation fires.
+
+    Note on subclassing: in v0.9.0 ``CadenceGuard.check()`` reads the
+    JSON store directly under ``_CADENCE_FILE_LOCK`` instead of calling
+    ``self.last_ts()``, so subclasses that overrode ``last_ts()`` to
+    customise the read path will no longer be invoked by ``check()``.
+    This is a tiny subclassing-contract change; the public API on the
+    instance is unchanged.
     """
-    cg = guard if guard is not None else CadenceGuard(min_interval_sec=min_interval_sec)
+    if guard is None:
+        # v0.9.0: explicit arg wins when non-zero; zero defers to env var
+        # (which itself falls back to disabled when unset).
+        resolved_cross = (
+            cross_model_interval_sec
+            if cross_model_interval_sec > 0
+            else _resolve_cross_model_interval_for_require()
+        )
+        cg = CadenceGuard(
+            min_interval_sec=min_interval_sec,
+            cross_model_interval_sec=resolved_cross,
+        )
+    else:
+        cg = guard
     cg.check(model_id)
     cg.mark_load(model_id)
+
+
+def _resolve_cross_model_interval_for_require() -> float:
+    """v0.9.0 require_cadence_clear env-var fallback.
+
+    Returns env var value when set (including explicit ``0`` to disable),
+    else ``0.0`` to preserve v0.8.x behaviour. This intentionally differs
+    from :func:`_resolve_cross_model_interval` (which defaults to 60s)
+    because :func:`require_cadence_clear` is the back-compat entry point;
+    the 60s C5 default is opt-in via ``CadenceGuard`` constructor or env.
+    """
+    raw = os.getenv(_CROSS_MODEL_ENV_VAR, "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        log.warning(
+            "Invalid %s=%r, falling back to 0.0 (disabled)",
+            _CROSS_MODEL_ENV_VAR, raw,
+        )
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -4325,3 +4529,194 @@ def subprocess_inference_guard(model_id: str) -> Generator[None, None, None]:
                 "subprocess_inference_guard POST breadcrumb failed for %s: %s",
                 model_id, exc,
             )
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 — Gemma-4 first-generate settle (C7, 2026-04-25)
+# ---------------------------------------------------------------------------
+#
+# Empirical analysis of Harper's 8-panic timeline: 7 of 8 panics landed on
+# the FIRST ``generate()`` call of a gemma-4 family model, within 7–66s of
+# the worker becoming ready. Four pre-existing flush barriers (parent-side
+# clear_cache, subprocess_inference_guard PRE, load barrier, shutdown
+# barrier) failed to catch these — the race is between Metal command buffer
+# completion on model load and the first forward pass.
+#
+# ``gemma4_generation_flush`` inserts a mandatory synchronize + clear_cache
+# + sleep window between worker load and first generate. It is NOT a block:
+# it cannot stop a panic that is already in flight at the kernel level.
+# What it does is extend the settle window so the kernel has time to finish
+# its own bookkeeping before the first user-space Metal allocation. In
+# combination with cross-model cadence (v0.9.0 C5) it meaningfully reduces
+# panic frequency on gemma-4 loads but does not eliminate it — see
+# KNOWN_PANIC_MODELS for the escape hatch when metal-guard is not enough.
+#
+# Env knobs:
+#   METALGUARD_GEMMA4_FIRSTGEN_DISABLED=1   -> disable entirely
+#   METALGUARD_GEMMA4_FIRSTGEN_SLEEP_SEC    -> override sleep (default 3.0)
+def gemma4_generation_flush(model_id: str, generate_call_count: int) -> None:
+    """First-generate Metal settle window for the gemma-4 family.
+
+    Call this immediately before the *first* ``generate()`` on a freshly
+    loaded worker. Subsequent calls (``generate_call_count != 0``) are
+    no-ops. Non-gemma-4 models are no-ops.
+
+    The function performs a best-effort ``mx.synchronize()`` +
+    ``mx.clear_cache()`` + ``time.sleep(3.0)``. All steps are optional;
+    the function never raises and never blocks on failure of any step.
+
+    Args:
+        model_id: the model identifier to match against the gemma-4 family.
+        generate_call_count: number of prior successful generate calls on
+            this worker. ``0`` means this call will be the first.
+
+    Renamed in v0.9.0 from ``gemma4_firstgen_guard`` — the name "guard"
+    incorrectly suggested a block; the function is a flush + settle window,
+    not a gate. If you need a gate, use :class:`CircuitBreaker` or
+    :func:`require_cadence_clear`.
+    """
+    if os.environ.get("METALGUARD_GEMMA4_FIRSTGEN_DISABLED") == "1":
+        return
+    if generate_call_count != 0:
+        return
+    if not _is_gemma4_family(model_id):
+        return
+
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+    except Exception as exc:
+        log.warning(
+            "gemma4_generation_flush: mlx.core import failed (%s); "
+            "flush disabled for %s", exc, model_id,
+        )
+        return
+
+    try:
+        metal_guard.breadcrumb(f"GEMMA4_FLUSH: {model_id}")
+    except Exception as exc:
+        log.debug("gemma4_generation_flush breadcrumb PRE failed: %s", exc)
+
+    try:
+        mx.synchronize()
+    except Exception as exc:
+        # log.debug rather than warning: failures of the best-effort
+        # flush are dominated by the kernel-panic signal itself.
+        # Emitting warnings per-load produces log spam when the driver
+        # is already in trouble.
+        log.debug(
+            "gemma4_generation_flush synchronize failed for %s: %s",
+            model_id, exc,
+        )
+    try:
+        mx.clear_cache()
+    except Exception as exc:
+        log.debug(
+            "gemma4_generation_flush clear_cache failed for %s: %s",
+            model_id, exc,
+        )
+
+    try:
+        sleep_sec = float(
+            os.environ.get("METALGUARD_GEMMA4_FIRSTGEN_SLEEP_SEC", "3.0")
+        )
+    except ValueError:
+        sleep_sec = 3.0
+    time.sleep(max(0.0, sleep_sec))
+
+    try:
+        metal_guard.breadcrumb(f"GEMMA4_FLUSH_DONE: {model_id}")
+    except Exception as exc:
+        log.debug("gemma4_generation_flush breadcrumb POST failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# v0.9.0 — Known panic models (2026-04-25)
+# ---------------------------------------------------------------------------
+#
+# When the same model kernel-panics multiple times in production even with
+# every metal-guard defence engaged, we record it here. metal-guard narrows
+# the race window; it does NOT fix the underlying Apple IOGPU driver bug,
+# and for some models the race window is wide enough that narrowing is not
+# enough. For those models, the right operational answer is to switch
+# backends (Ollama / llama.cpp) or pivot to a different model family (MoE
+# variants have a smaller active-param footprint and are markedly safer).
+#
+# Callers should invoke :func:`check_known_panic_model(model_id)` at load
+# time and escalate — log, refuse, or re-route — based on their own policy.
+# :func:`warn_if_known_panic_model` is provided as a fire-and-forget
+# convenience that emits a single ``log.warning`` per process per model_id.
+
+KNOWN_PANIC_MODELS: dict[str, dict[str, Any]] = {
+    "mlx-community/gemma-4-31b-it-8bit": {
+        "panic_signature": "IOGPUMemory.cpp:492 prepare_count_underflow",
+        "first_observed": "2026-04-23",
+        "last_observed": "2026-04-24",
+        "reproductions": [
+            "Harper production 2026-04-23 03:14 local, PID 67840, "
+            "~6 min worker-ready to panic, pre-cross-model-cadence",
+            "Harper production 2026-04-24 03:14 local, PID 26608, "
+            "~1.5 min worker-ready to panic, same pipeline as prior",
+        ],
+        "community": [
+            "Hannecke — M4 Max 64GB — ml-explore/mlx#3186, "
+            "pivoted to Qwen3-Coder-30B-A3B MoE",
+            "lmstudio bug #1740 — hybrid attention (50 sliding + 10 global) "
+            "KV cache 8-bit weights 34GB + full ctx KV 20GB+ > 54GB",
+            "ml-explore/mlx-lm#883 (M3 Ultra 96GB)",
+        ],
+        "recommendation": (
+            "metal-guard v0.9.0 narrows the race window via cross-model "
+            "cadence (C5) + gemma4_generation_flush (C7) + "
+            "subprocess_inference_guard (B1), but does NOT eliminate "
+            "panic on this model in Harper's production workload. If you "
+            "see repeat panics with metal-guard fully engaged, switch "
+            "backend (Ollama / llama.cpp) or pivot to an MoE variant "
+            "(e.g. mlx-community/gemma-4-26b-a4b-it-4bit)."
+        ),
+        "upstream": [
+            "https://github.com/ml-explore/mlx/issues/3186",
+            "https://github.com/ml-explore/mlx-lm/issues/883",
+            "https://github.com/ml-explore/mlx/issues/3346",
+        ],
+    },
+}
+
+_WARNED_PANIC_MODELS: set[str] = set()
+
+
+def check_known_panic_model(model_id: str) -> dict[str, Any] | None:
+    """Return the advisory dict for a known-panic model, else ``None``.
+
+    Policy is the caller's — metal-guard does not refuse loads on its own.
+    Typical pattern::
+
+        advisory = metal_guard.check_known_panic_model(model_id)
+        if advisory is not None:
+            log.warning(
+                "Loading known-panic model %s: %s",
+                model_id, advisory["recommendation"],
+            )
+    """
+    return KNOWN_PANIC_MODELS.get(model_id)
+
+
+def warn_if_known_panic_model(model_id: str) -> bool:
+    """Emit a single ``log.warning`` per process per model_id.
+
+    Returns True if a warning was emitted (or would have been on a prior
+    call), False if the model is not in the known-panic list. Safe to
+    call on every load — idempotent via a module-level set.
+    """
+    advisory = check_known_panic_model(model_id)
+    if advisory is None:
+        return False
+    if model_id in _WARNED_PANIC_MODELS:
+        return True
+    _WARNED_PANIC_MODELS.add(model_id)
+    log.warning(
+        "metal-guard: %s is in KNOWN_PANIC_MODELS — %s",
+        model_id, advisory["recommendation"],
+    )
+    return True

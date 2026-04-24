@@ -6,7 +6,7 @@ Apple Silicon 上 [MLX](https://github.com/ml-explore/mlx) 的 GPU 安全層。
 
 防止 MLX 推論時 Metal 驅動程式 bug 造成的 kernel panic 與 OOM 崩潰 —— 尤其是多模型 pipeline、長時間運行的 server、以及大量 tool calling 的 agent 框架。
 
-**當前版本：** v0.8.0 — 發行歷史與每個功能的背景見 [CHANGELOG.md](CHANGELOG.md)。
+**當前版本：** v0.9.0 — 發行歷史與每個功能的背景見 [CHANGELOG.md](CHANGELOG.md)。v0.9.0 新增 `subprocess_inference_guard`（B1）、跨模型 cadence + gemma-4 90 秒下限（C5）、`gemma4_generation_flush`（C7）、以及 `KNOWN_PANIC_MODELS` advisory 登記表。
 
 ## 搜這些字串跑來的？你來對地方了。
 
@@ -304,6 +304,61 @@ Breadcrumb 記錄預設為相對路徑 `logs/metal_breadcrumb.log`，以 `MetalG
 - Mac Studio M1 Ultra（64 GB）—— 裝 MetalGuard 前 9 次 kernel panic，L9 上線後 24 h 無 panic
 - 10 人批次 pipeline：約 90 次模型 load/unload 循環、994 秒、零崩潰
 - 模型：Mistral-Small-3.2-24B、Phi-4-mini、Gemma-4-26B / 31B、Pixtral-12B、LFM2-VL-3B（4-bit 與 8-bit）
+
+## 已知受影響模型（v0.9.0, 2026-04）
+
+有些模型的 race window 夠寬，MetalGuard 能收窄但收不掉。碰到時我們記在這邊，讓你在 production 載入前可以先做判斷。
+
+### `mlx-community/gemma-4-31b-it-8bit` —— 重複犯案
+
+Harper Mac Studio 上 **相隔 24 小時、同一條 pipeline、同一個 model**，兩次 production kernel panic，panic 簽名一致：`IOGPUMemory.cpp:492 "completeMemory() prepare count underflow"`。
+
+| #   | 本地時間         | PID   | Spawn → panic | 情境                                                    |
+|-----|------------------|-------|--------------:|---------------------------------------------------------|
+|  7  | 2026-04-23 03:14 | 67840 |        約 6 分 | rezivot pipeline，當時還沒 wire 跨模型 cadence           |
+| 11  | 2026-04-24 03:14 | 26608 |      約 1.5 分 | 同 #7 pipeline；classic L9 防線都在的情況下，worker ready 後 ~1.5 分仍 panic |
+
+社群交叉佐證（全部 2026-04）：
+
+- [Hannecke —「MLX Crashed My Mac」（Medium）](https://medium.com/@michael.hannecke/how-my-local-coding-agent-crashed-my-mac-and-what-i-learned-about-mlx-memory-management-e0cbad01553c) —— M4 Max 64 GB、同 panic 簽名；pivot 去 `Qwen3-Coder-30B-A3B` MoE。
+- [`lmstudio-ai/lmstudio-bug-tracker#1740`](https://github.com/lmstudio-ai/lmstudio-bug-tracker/issues/1740)「Gemma-4 31b KV excessive KV cache footprint」—— 同一家族的 KV 膨脹問題：8192 context 就吃 26 GB VRAM；hybrid attention（50 sliding + 10 global）KV cache + 8-bit 權重（約 34 GB）+ full-context KV 把 64 GB Mac 逼過 unified memory 邊緣。
+- [`ml-explore/mlx-lm#883`](https://github.com/ml-explore/mlx-lm/issues/883) —— M3 Ultra 96 GB，同 panic 簽名。
+- [`ml-explore/mlx#3186`（2026-04-24 留言）](https://github.com/ml-explore/mlx/issues/3186#issuecomment-4314204974) —— 獨立第三方觀測：Mac mini M4 base 32 GB、macOS 26.4.1（`25E253`）、mlx 0.31.2、`mlx-community/Qwen3.6-35B-A3B-4bit`。`mlx_lm.server` 啟動 8 分 16 秒後 panic；`--prompt-cache-bytes 8 GiB` 擋不住；reporter 因此 production serving 改走 `llama.cpp`。留言中明確引用本專案的「two-trigger-path hypothesis」。
+
+**結論。** macOS 26.4.x 沒修這個 bug。macOS 26.5 beta 沒修這個 bug。RAM 加到 96 GB 沒擋住。MetalGuard v0.9.0 收窄了多個 race window（跨模型 cadence、gemma-4 90 秒下限、首次 generate flush、subprocess inference guard），但 Harper 實際 workload 上對這個模型仍無法完全消除 panic。
+
+程式內可查詢 advisory：
+
+```python
+from metal_guard import check_known_panic_model, warn_if_known_panic_model
+
+advisory = check_known_panic_model(model_id)
+if advisory is not None:
+    # 自行決策：拒絕載入、換 backend、或明示 ack 後續載
+    ...
+
+# 或 fire-and-forget：同一個 model_id 每個 process 只 log.warning 一次
+warn_if_known_panic_model(model_id)
+```
+
+## 當 MetalGuard 不夠的時候
+
+如果 v0.9.0 所有防線都上了（B1 + C5 + C7 + CircuitBreaker），同一個模型還是重複 panic，那代表 race window 寬到 userspace 層收不下來。兩個換路方案，依投資報酬率排序：
+
+1. **換 backend。** [Ollama](https://ollama.com/) 與 [`llama.cpp`](https://github.com/ggml-org/llama.cpp) 底層一樣是 Metal MPS，但走 persistent worker 架構，整條 subprocess teardown race 直接繞開。Harper 的 `harper-finance` 專案 2026-04-23 切 Ollama 之後零 panic。[`mlx#3186` 的 M4-base reporter](https://github.com/ml-explore/mlx/issues/3186#issuecomment-4314204974) production serving 因同樣理由改走 `llama.cpp`。代價是原始吞吐（該 report 量到 MLX 在 prefill 快 30–55 %），換到的是「不會把整台機器打翻」。
+
+2. **換模型家族。** Mixture-of-Experts（MoE）變體 —— 例如 [`mlx-community/gemma-4-26b-a4b-it-4bit`](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit)、`Qwen3-Coder-30B-A3B` —— 每次 forward 的 active-parameter 少得多，KV 成長曲線窄很多。社群紀錄（Hannecke、lmstudio#1740）都收斂到「同生態裡最穩的方案就是換 MoE」。
+
+MetalGuard 跟兩個換路方案是**互補的** —— 就算你改用 Ollama，每個 request spawn 一次 subprocess worker 的話，`subprocess_inference_guard` 依然有用；就算你整套換 backend，只要會 hot-swap 模型，`CadenceGuard` 依然幫得上忙。
+
+### 一條學費教訓的 SOP
+
+我們時間線上的 panic #10（見 [CHANGELOG](CHANGELOG.md)）是 host terminal 上一條 *互動式* `python -c "import sentence_transformers"` 觸發的 —— 一個查版本的指令，跟 production MLX workload 完全無關。任何會 import `torch`、`mlx`、`mlx_lm`、`mlx_vlm`、`sentence_transformers`、`transformers`、`diffusers`、`accelerate` 的動作都會把 Metal MPS backend 初始化起來，然後在 process exit 階段踩到同一個 kernel bug。panic cooldown 作用中時，優先用：
+
+- `pip show <pkg>` 查版本，或
+- `python -c "import importlib.metadata as m; print(m.version('<pkg>'))"`（不會 cascade import 整個套件）。
+
+**絕對不要**在 cooldown 作用中跑 `python -c "import <ml-package>; print(<ml-package>.__version__)"`。
 
 ## 限制 —— 這是硬撐，不是修好
 
