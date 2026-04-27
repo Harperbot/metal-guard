@@ -120,11 +120,75 @@ This affects any workflow that loads and unloads multiple MLX models in sequence
 
 ## Installation
 
+> **PyPI status (2026-04-27)**: metal-guard is **not yet on PyPI**. Use one of the three options below until v0.10.x ships there. Tracking issue: open an issue if you need PyPI urgently.
+
+### Option A — pip from GitHub (recommended, 1 line)
+
+Installs from a tagged release — gives you the `metal-guard` and `mlx-safe-python` console scripts plus the `metal_guard` Python module:
+
 ```bash
-pip install metal-guard
+pip install "git+https://github.com/Harperbot/metal-guard.git@v0.10.0"
 ```
 
-Single-file drop-in also works — `metal_guard.py` has zero dependencies beyond the Python standard library and optional `mlx`.
+After install:
+
+```bash
+metal-guard --version          # → metal-guard 0.10.0
+metal-guard panic-gate         # L10 cooldown verdict
+metal-guard status             # full snapshot
+mlx-safe-python -c "import torch"   # interactive shell guard
+```
+
+To upgrade to a future release: `pip install --upgrade "git+https://github.com/Harperbot/metal-guard.git@vX.Y.Z"`.
+
+### Option B — Single-file drop-in (zero install, no pip)
+
+`metal_guard.py` has **zero dependencies** beyond the Python standard library (and optional `mlx` for memory introspection). Download once, import directly:
+
+```bash
+mkdir -p ~/lib/metal-guard
+curl -L -o ~/lib/metal-guard/metal_guard.py \
+  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.10.0/metal_guard.py
+```
+
+Then in your code:
+
+```python
+import sys; sys.path.insert(0, "/Users/<you>/lib/metal-guard")
+import metal_guard as mg
+verdict = mg.evaluate_panic_cooldown()
+print(verdict.exit_code, verdict.reason)
+```
+
+This path is the right choice for launchd plist wrappers, panic-recovery scripts, and CI runners that must work even when the rest of the Python install is wedged.
+
+### Option C — Local clone (for development / running tests)
+
+```bash
+git clone https://github.com/Harperbot/metal-guard.git
+cd metal-guard
+pip install -e ".[test]"
+pytest -q
+```
+
+Editable install picks up your local edits without re-installing. The `[test]` extra pulls in `pytest>=7.0`.
+
+### Verifying the install
+
+After Option A or C, the gate should self-test:
+
+```bash
+$ metal-guard panic-gate
+🟢 PROCEED  no recent IOGPU panics
+  24h=0 72h=0
+$ metal-guard status
+metal-guard 0.10.0  🟢 OK
+  mode        defensive — defensive mode (default)
+  panics      0 in last 72h
+  ...
+```
+
+If `metal-guard` is not on `PATH` after pip install, your `pip --user` bin dir is probably missing — `python3 -m metal_guard_cli panic-gate` works as a fallback.
 
 ## Quick Start
 
@@ -173,8 +237,9 @@ metal_guard.start_kv_cache_monitor(headroom_gb=config["kv_headroom_gb"])
 
 MetalGuard is organised as **defence layers (L1–L13)** plus a set of
 **preventive helpers (R-series)** and the **`KNOWN_PANIC_MODELS` registry**.
-Every feature is available from the single `metal_guard` module — `pip install metal-guard`
-or drop the file in your `PYTHONPATH`. See [CHANGELOG.md](CHANGELOG.md) for when
+Every feature is available from the single `metal_guard` module — install via
+`pip install "git+https://github.com/Harperbot/metal-guard.git@v0.10.0"` or
+drop `metal_guard.py` in your `PYTHONPATH` (see [Installation](#installation) above). See [CHANGELOG.md](CHANGELOG.md) for when
 each layer landed and the incident that motivated it.
 
 Layer ordering is a defence-in-depth onion: L1–L8 narrow race windows during a

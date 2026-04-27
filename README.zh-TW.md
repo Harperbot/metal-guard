@@ -117,11 +117,75 @@ panic(cpu 4 caller 0xfffffe0032a550f8):
 
 ## 安裝
 
+> **PyPI 狀態（2026-04-27）**：metal-guard **尚未上 PyPI**。在 v0.10.x 上 PyPI 之前，請從以下三條路擇一。急需 PyPI 請開 issue。
+
+### 選項 A — pip 從 GitHub 裝（推薦，一行）
+
+從 tag release 裝 —— 會拿到 `metal-guard` 跟 `mlx-safe-python` 兩個 console scripts 跟 `metal_guard` Python module：
+
 ```bash
-pip install metal-guard
+pip install "git+https://github.com/Harperbot/metal-guard.git@v0.10.0"
 ```
 
-也可以直接把 `metal_guard.py` 丟進專案 —— 除 Python 標準庫與可選 `mlx` 外沒有依賴。
+裝完：
+
+```bash
+metal-guard --version          # → metal-guard 0.10.0
+metal-guard panic-gate         # L10 cooldown 判斷
+metal-guard status             # 完整 snapshot
+mlx-safe-python -c "import torch"   # 互動 shell 守衛
+```
+
+升級新版本：`pip install --upgrade "git+https://github.com/Harperbot/metal-guard.git@vX.Y.Z"`。
+
+### 選項 B — 單檔丟入（零安裝、不用 pip）
+
+`metal_guard.py` **零依賴**（除 Python 標準庫 + 可選 `mlx`）。下載一次，直接 import：
+
+```bash
+mkdir -p ~/lib/metal-guard
+curl -L -o ~/lib/metal-guard/metal_guard.py \
+  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.10.0/metal_guard.py
+```
+
+程式裡：
+
+```python
+import sys; sys.path.insert(0, "/Users/<你>/lib/metal-guard")
+import metal_guard as mg
+verdict = mg.evaluate_panic_cooldown()
+print(verdict.exit_code, verdict.reason)
+```
+
+這條路適合 launchd plist wrapper、panic recovery script、CI runner —— 即使 Python install 其他部分壞了也能跑。
+
+### 選項 C — 本地 clone（開發 / 跑 tests）
+
+```bash
+git clone https://github.com/Harperbot/metal-guard.git
+cd metal-guard
+pip install -e ".[test]"
+pytest -q
+```
+
+editable install 會即時反映本地改動。`[test]` extra 會拉 `pytest>=7.0`。
+
+### 驗證安裝
+
+選項 A 或 C 後 gate 該自檢通過：
+
+```bash
+$ metal-guard panic-gate
+🟢 PROCEED  no recent IOGPU panics
+  24h=0 72h=0
+$ metal-guard status
+metal-guard 0.10.0  🟢 OK
+  mode        defensive — defensive mode (default)
+  panics      0 in last 72h
+  ...
+```
+
+若 `metal-guard` 不在 `PATH`，可能 `pip --user` bin dir 沒加 — 用 `python3 -m metal_guard_cli panic-gate` 替代。
 
 ## 快速開始
 

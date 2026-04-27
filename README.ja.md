@@ -117,11 +117,75 @@ panic(cpu 4 caller 0xfffffe0032a550f8):
 
 ## インストール
 
+> **PyPI ステータス（2026-04-27）**：metal-guard は **まだ PyPI に未公開** です。v0.10.x が PyPI に上がるまで、以下の 3 つのオプションのいずれかを使ってください。PyPI が急ぎで必要なら issue を立ててください。
+
+### オプション A — GitHub から pip で（推奨、1 行）
+
+タグリリースからインストール —— `metal-guard` と `mlx-safe-python` の console scripts に加え、`metal_guard` Python モジュールが入ります：
+
 ```bash
-pip install metal-guard
+pip install "git+https://github.com/Harperbot/metal-guard.git@v0.10.0"
 ```
 
-`metal_guard.py` をプロジェクトにコピーしても OK —— Python 標準ライブラリと任意の `mlx` 以外に依存はありません。
+インストール後：
+
+```bash
+metal-guard --version          # → metal-guard 0.10.0
+metal-guard panic-gate         # L10 cooldown 判定
+metal-guard status             # フルスナップショット
+mlx-safe-python -c "import torch"   # 対話シェルガード
+```
+
+将来のリリースへのアップグレード：`pip install --upgrade "git+https://github.com/Harperbot/metal-guard.git@vX.Y.Z"`。
+
+### オプション B — 単一ファイル直接配置（インストール不要、pip 不要）
+
+`metal_guard.py` は **依存ゼロ**（Python 標準ライブラリ + 任意の `mlx` 以外）。一度ダウンロードして直接 import：
+
+```bash
+mkdir -p ~/lib/metal-guard
+curl -L -o ~/lib/metal-guard/metal_guard.py \
+  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.10.0/metal_guard.py
+```
+
+コード内で：
+
+```python
+import sys; sys.path.insert(0, "/Users/<you>/lib/metal-guard")
+import metal_guard as mg
+verdict = mg.evaluate_panic_cooldown()
+print(verdict.exit_code, verdict.reason)
+```
+
+このパスは launchd plist ラッパー、panic リカバリスクリプト、CI ランナーに最適 —— Python インストールの他の部分が壊れていても動きます。
+
+### オプション C — ローカル clone（開発 / テスト実行）
+
+```bash
+git clone https://github.com/Harperbot/metal-guard.git
+cd metal-guard
+pip install -e ".[test]"
+pytest -q
+```
+
+editable install はローカル編集を即座に反映。`[test]` extra は `pytest>=7.0` を引きます。
+
+### インストール検証
+
+オプション A または C 後、gate がセルフテスト通過するはず：
+
+```bash
+$ metal-guard panic-gate
+🟢 PROCEED  no recent IOGPU panics
+  24h=0 72h=0
+$ metal-guard status
+metal-guard 0.10.0  🟢 OK
+  mode        defensive — defensive mode (default)
+  panics      0 in last 72h
+  ...
+```
+
+`metal-guard` が `PATH` にない場合、`pip --user` の bin ディレクトリが通っていない可能性 —— `python3 -m metal_guard_cli panic-gate` でフォールバック可能。
 
 ## クイックスタート
 
