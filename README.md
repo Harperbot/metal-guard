@@ -6,7 +6,33 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version:** v0.9.0 — see [CHANGELOG.md](CHANGELOG.md) for release history and per-feature rationale. v0.9.0 adds `subprocess_inference_guard` (B1), cross-model cadence + gemma-4 90-second floor (C5), `gemma4_generation_flush` (C7), and the `KNOWN_PANIC_MODELS` advisory registry.
+**Current version: v0.10.0** — see [CHANGELOG.md](CHANGELOG.md) for release history and per-feature rationale.
+
+### What's in v0.10
+
+metal-guard now covers the **full lifecycle** of an Apple-Silicon kernel panic — before, during, and after:
+
+| Phase | Layer | What it does |
+|---|---|---|
+| Before | L1–L9 (v0.1–v0.9) | Thread tracking / cleanup / OOM recovery / pre-load checks / long-run safety / dual-mode / subprocess isolation / cross-process lock / cadence + circuit breaker |
+| **After reboot (new)** | **L10 panic cooldown gate** | Refuses to re-launch MLX work for 2h–72h after a panic, preventing immediate auto-re-panic when launchd respawns plists |
+| **Pre-panic warning (new)** | **L11 subprocess orphan monitor** | Detects `SUBPROC_PRE` without matching `SUBPROC_POST` after 90s — SIGKILL the worker before the kernel does |
+| **After reboot (new)** | **L12 postmortem auto-collect** | Bundles `panic-full-*.panic` + breadcrumb tail + `mx.metal` stats + `index.md` summary into a single directory |
+| **Cross-process state (new)** | **L13 status snapshot** | Versioned JSON for menu bar / dashboard / ssh inspection consumers — no `import metal_guard` needed downstream |
+| All layers | **`KNOWN_PANIC_MODELS` registry** | Community-curated `(model, hardware, panic signature, workload, workaround)` data — see [Community Panic Registry](#-community-panic-registry--known_panic_models) below |
+
+New CLI surface ships with v0.10:
+
+```bash
+metal-guard panic-gate            # L10: rc=0 proceed / rc=2 cooldown / rc≥3 broken
+metal-guard postmortem ./bundle   # L12: collect after reboot
+metal-guard status-write --once   # L13: write JSON snapshot
+metal-guard orphan-scan           # L11: pre-panic stuck-worker detection
+metal-guard ack                   # L10: clear lockout (require explicit user touch)
+mlx-safe-python -c "import torch" # interactive shell guard — refuses ad-hoc imports during cooldown
+```
+
+v0.10 promotes four defensive layers from Harper's private fork after two weeks of production validation across 11 panic incidents. The honest caveat from earlier releases still holds: metal-guard narrows race windows around the Apple IOGPU driver bug — it does not fix the bug. v0.10 extends the defence surface from "during run" to "after reboot" and "before kernel kill".
 
 ## Landed here searching for one of these? You're in the right place.
 
@@ -145,10 +171,16 @@ metal_guard.start_kv_cache_monitor(headroom_gb=config["kv_headroom_gb"])
 
 ## Features
 
-MetalGuard is organised as **defence layers (L1–L9)** plus a set of
-**preventive helpers (R-series)**. Every feature is available from the
-single `metal_guard` module. See [CHANGELOG.md](CHANGELOG.md) for when
-each one landed and the incident that motivated it.
+MetalGuard is organised as **defence layers (L1–L13)** plus a set of
+**preventive helpers (R-series)** and the **`KNOWN_PANIC_MODELS` registry**.
+Every feature is available from the single `metal_guard` module — `pip install metal-guard`
+or drop the file in your `PYTHONPATH`. See [CHANGELOG.md](CHANGELOG.md) for when
+each layer landed and the incident that motivated it.
+
+Layer ordering is a defence-in-depth onion: L1–L8 narrow race windows during a
+run, L9 + L11 short-circuit just before a kernel-level abort, L10 + L12 handle
+recovery after a panic + reboot, and L13 surfaces all of the above as a JSON
+snapshot for cross-process consumers.
 
 ### L1 — Thread tracking
 
@@ -252,6 +284,79 @@ Last line of defence after the first eight layers. Written in response to a kern
 | `CircuitBreaker(*, window_sec=3600, panic_threshold=2, cooldown_sec=3600)` | Refuse new workers after a panic cluster |
 | `CircuitBreaker.check() / .status() / .clear()` | Gate, dashboard, operator override |
 | `detect_panic_signature(text) -> (name, explanation)` | Classify a panic log into `prepare_count_underflow` / `pending_memory_set` / `ctxstore_timeout` / `metal_oom` |
+
+### L10 — Panic cooldown gate *(v0.10.0)*
+
+After a kernel panic + macOS reboot, launchd auto-respawns plists ~14 minutes later. Without a gate, the next MLX workload can immediately re-trigger the same driver bug. L10 reads `/Library/Logs/DiagnosticReports/` for AND-pattern IOGPU panics and applies a staircase cooldown (1 panic → 2h, ≥2 in 24h or ≥3 in 72h → lockout requiring `~/.metal-guard-ack` touch).
+
+| API | What it does |
+|---|---|
+| `evaluate_panic_cooldown() -> CooldownVerdict` | Stdlib-only evaluation; `verdict.exit_code` ∈ {0=proceed, 2=cooldown, ≥3=gate broken} |
+| `scan_recent_panics(hours=72.0) -> list[PanicRecord]` | AND-pattern (`prepare_count_underflow` + `IOGPUMemory.cpp:NNN`) scan |
+| `mark_panic_sentinel_cooldown(duration_hours)` | Extend cooldown beyond DiagnosticReports rotation lag (called by L12) |
+| `ack_panic_lockout()` | Atomic touch `~/.metal-guard-ack` to clear an active lockout |
+| `clear_panic_ack()` / `clear_panic_sentinel()` | Operator overrides |
+| `metal-guard panic-gate` | CLI wrapper for plist scripts (mirrors verdict exit codes) |
+| `metal-guard ack` | CLI wrapper for ack |
+
+Env: `METALGUARD_PANIC_COOLDOWN_STAGE1_H` / `_LOCKOUT_24H_N` / `_LOCKOUT_72H_N` / `_LOCKOUT_MAX_H` / `_GATE_DISABLED=1`.
+
+### L11 — Subprocess orphan monitor *(v0.10.0)*
+
+Pre-panic signal: a `SUBPROC_PRE: <model>` breadcrumb without a matching `SUBPROC_POST` after 90 seconds strongly suggests Metal is stuck. Caller can SIGKILL the worker pid before the kernel does (saves a reboot).
+
+| API | What it does |
+|---|---|
+| `scan_orphan_subproc_pre(threshold_sec=90.0) -> list[OrphanPre]` | FIFO-paired PRE↔POST scan over breadcrumb tail |
+| `metal-guard orphan-scan [--threshold-sec N]` | CLI wrapper |
+
+Disabled by `METALGUARD_SUBPROC_ORPHAN_WATCH_DISABLED=1`. Threshold via `METALGUARD_SUBPROC_ORPHAN_THRESHOLD_SEC`.
+
+### L12 — Postmortem auto-collect *(v0.10.0)*
+
+After a panic + reboot, this collects the diagnostic bundle into a single directory: panic-full-*.panic files (capped 5 files / 5MB each), last 500 lines of `metal_breadcrumb.log`, panics.jsonl history, mx.metal stats, and an `index.md` summary. When a panic is found, also writes a sentinel cooldown so L10 defers further runs even if DiagnosticReports rotates.
+
+| API | What it does |
+|---|---|
+| `run_postmortem(output_dir) -> dict` | Full orchestration; returns paths + panic count |
+| `metal-guard postmortem <output_dir>` | CLI wrapper |
+
+Kill-switch: `METALGUARD_POSTMORTEM_DISABLED=1`. Designed to be called from a launchd wrapper after reboot; pair with [Telegram alerts in pure bash](#) for ops integration.
+
+### L13 — Status snapshot *(v0.10.0)*
+
+Versioned JSON snapshot for cross-process consumers (menu bar apps, dashboards, ssh inspection scripts) that should not import `metal_guard` directly. Schema is append-only across minor versions.
+
+| API | What it does |
+|---|---|
+| `get_status_snapshot(*, include_panics=True, breadcrumb_lines=20) -> dict` | Aggregate memory / KV monitor / panics / lock holder / mode / L10 verdict |
+| `write_status_snapshot(out_path=None)` | Atomic write to `~/.cache/metal-guard/status.json` |
+| `metal-guard status-write [--once \| --interval 30]` | CLI / daemon wrapper |
+| `STATUS_SNAPSHOT_SCHEMA_VERSION` | Bumped on breaking changes |
+
+Run as a 30s-interval daemon under launchd to feed your menu bar app:
+
+```xml
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.metal-guard.status-writer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string><string>metal-guard</string>
+    <string>status-write</string><string>--interval</string><string>30</string>
+  </array>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+```
+
+### Interactive shell guard
+
+`scripts/mlx-safe-python` (bash, single file, stdlib only) — drop into PATH to refuse ad-hoc `python -c "import torch/mlx"` while a cooldown is active. Lets `pip` / `build` / `venv` pass through (they don't import Metal). Exit codes: 0 ran / 10 blocked / 11 fail-open.
+
+```bash
+mlx-safe-python -c "import torch; print(torch.__version__)"   # blocked in cooldown
+mlx-safe-python -m pip show torch                              # passes — no Metal import
+MLX_SAFE_PYTHON_FORCE=1 mlx-safe-python -c "..."               # explicit override + WARN
+```
 
 ### Hardware awareness
 

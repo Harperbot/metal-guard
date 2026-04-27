@@ -65,12 +65,16 @@ License: MIT
 
 from __future__ import annotations
 
+import datetime
 import gc
+import glob
 import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import re
+import shutil
 import signal
 import sys
 import threading
@@ -81,7 +85,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -4720,3 +4724,925 @@ def warn_if_known_panic_model(model_id: str) -> bool:
         model_id, advisory["recommendation"],
     )
     return True
+
+
+# ===========================================================================
+# v0.10.0 — L10/L11/L12/L13 Harper-private features promoted to public
+# (2026-04-27)
+#
+# These four layers were developed in Harper's private fork during the
+# 2026-04 panic series and used in production for two weeks. They cover
+# scenarios the public L1-L9 didn't address:
+#   L10: panic cooldown gate — auto re-panic prevention after reboot
+#   L11: subprocess orphan monitor — pre-panic SUBPROC_PRE/POST signal
+#   L12: postmortem auto-collect — bundle .panic + breadcrumb after reboot
+#   L13: status snapshot — JSON for menu bar / dashboard consumers
+#
+# Path conventions: all state lives under ``~/.cache/metal-guard/`` (XDG-
+# compatible). User-facing ack file is ``~/.metal-guard-ack`` so a single
+# ``touch`` clears the lockout without spelunking caches.
+# ===========================================================================
+
+# ---------------------------------------------------------------------------
+# L10 — Panic cooldown gate (C1 in Harper fork)
+# ---------------------------------------------------------------------------
+
+PANIC_REPORTS_GLOBS: tuple[str, ...] = (
+    "/Library/Logs/DiagnosticReports/Retired/panic-full-*.panic",
+    "/Library/Logs/DiagnosticReports/panic-full-*.panic",
+)
+
+_PANIC_SENTINEL_PATH = os.path.expanduser("~/.cache/metal-guard/panic-sentinel.json")
+_PANIC_LOCKOUT_ACK_PATH = os.path.expanduser("~/.metal-guard-ack")
+
+# AND-pattern: core signature + IOGPUMemory.cpp context. Avoids matching
+# unrelated panics that mention "underflow" or "IOGPUMemory" in isolation.
+_PANIC_CORE_RE = re.compile(r"prepare[_ ]count[_ ]underflow", re.IGNORECASE)
+_PANIC_CONTEXT_RE = re.compile(
+    r"IOGPUMemory\.cpp:\d+|completeMemory\(\)",
+    re.IGNORECASE,
+)
+
+# Staircase cooldown defaults (env-overridable)
+_GATE_STAGE1_ENV = "METALGUARD_PANIC_COOLDOWN_STAGE1_H"
+_GATE_LOCKOUT_MAX_ENV = "METALGUARD_PANIC_LOCKOUT_MAX_H"
+_GATE_LOCKOUT_24H_N_ENV = "METALGUARD_PANIC_LOCKOUT_24H_N"
+_GATE_LOCKOUT_72H_N_ENV = "METALGUARD_PANIC_LOCKOUT_72H_N"
+_GATE_KILL_SWITCH_ENV = "METALGUARD_PANIC_GATE_DISABLED"
+
+_GATE_STAGE1_DEFAULT_H = 2.0
+_GATE_LOCKOUT_MAX_DEFAULT_H = 72.0
+_GATE_LOCKOUT_24H_N_DEFAULT = 2
+_GATE_LOCKOUT_72H_N_DEFAULT = 3
+
+
+@dataclass(frozen=True)
+class PanicRecord:
+    """A single IOGPU panic observation (filtered by AND-pattern match)."""
+    path: pathlib.Path
+    timestamp: datetime.datetime
+
+
+@dataclass(frozen=True)
+class CooldownVerdict:
+    """Evaluation result returned by :func:`evaluate_panic_cooldown`.
+
+    ``exit_code`` semantics mirror Harper's plist wrapper protocol:
+        0 → proceed (no panic / cooldown expired / kill-switch)
+        2 → skip this run (cooldown active or lockout)
+        ≥3 → gate broken; wrappers should treat as fail-open
+    """
+    exit_code: int
+    reason: str
+    recent_panics_24h: int
+    recent_panics_72h: int
+    cooldown_until: datetime.datetime | None
+
+
+def _gate_env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("metal-guard: invalid %s=%r, using default %.1f", name, raw, default)
+        return default
+
+
+def _gate_env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        log.warning("metal-guard: invalid %s=%r, using default %d", name, raw, default)
+        return default
+
+
+def _iter_panic_files() -> list[str]:
+    """Enumerate panic report files across Retired + active dirs."""
+    out: list[str] = []
+    for pattern in PANIC_REPORTS_GLOBS:
+        out.extend(glob.glob(pattern))
+    return out
+
+
+def _file_matches_iogpu_signature(path: str) -> bool:
+    """AND-match core + context. False positive guard for unrelated panics."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as exc:
+        # Some .panic files are root-owned 0600; cannot read = cannot confirm.
+        log.debug("metal-guard: cannot read %s: %s", path, exc)
+        return False
+    return bool(_PANIC_CORE_RE.search(content)) and bool(_PANIC_CONTEXT_RE.search(content))
+
+
+def scan_recent_panics(
+    hours: float = 72.0,
+    *,
+    now: datetime.datetime | None = None,
+) -> list[PanicRecord]:
+    """Return MLX-matching IOGPU panic records within the last ``hours``.
+
+    Uses file mtime as the panic timestamp. Sorted newest-first. Files
+    that fail to read or fail the AND-pattern are skipped silently —
+    this is best-effort detection, callers must not rely on completeness.
+    """
+    now = now or datetime.datetime.now()
+    cutoff = now - datetime.timedelta(hours=hours)
+    records: list[PanicRecord] = []
+    for p in _iter_panic_files():
+        try:
+            mtime_ts = os.path.getmtime(p)
+        except OSError:
+            continue
+        mtime = datetime.datetime.fromtimestamp(mtime_ts)
+        if mtime < cutoff:
+            continue
+        if not _file_matches_iogpu_signature(p):
+            continue
+        records.append(PanicRecord(pathlib.Path(p), mtime))
+    records.sort(key=lambda r: r.timestamp, reverse=True)
+    return records
+
+
+def _staircase_cooldown_hours(count_24h: int, count_72h: int) -> float | None:
+    """Map (24h count, 72h count) to cooldown duration.
+
+    Returns:
+        None — no cooldown
+        positive float — wait this many hours since latest panic
+        ``-1.0`` — lockout (require ack or absolute-max elapsed)
+    """
+    lock_24 = _gate_env_int(_GATE_LOCKOUT_24H_N_ENV, _GATE_LOCKOUT_24H_N_DEFAULT)
+    lock_72 = _gate_env_int(_GATE_LOCKOUT_72H_N_ENV, _GATE_LOCKOUT_72H_N_DEFAULT)
+    if count_24h >= lock_24 or count_72h >= lock_72:
+        return -1.0
+    if count_24h == 1:
+        return _gate_env_float(_GATE_STAGE1_ENV, _GATE_STAGE1_DEFAULT_H)
+    return None
+
+
+def _read_panic_sentinel_until(now: datetime.datetime) -> datetime.datetime | None:
+    """Read sentinel cooldown_until; None if absent / corrupt / expired."""
+    path = pathlib.Path(_PANIC_SENTINEL_PATH)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        log.warning("metal-guard: panic sentinel corrupt (%s), ignoring", exc)
+        return None
+    raw = data.get("cooldown_until")
+    if not isinstance(raw, str):
+        return None
+    try:
+        until = datetime.datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if until <= now:
+        return None
+    return until
+
+
+def _read_lockout_ack_valid(
+    now: datetime.datetime,
+    latest_panic: datetime.datetime | None = None,
+) -> bool:
+    """Return True if ack is valid (24h TTL AND mtime > latest panic).
+
+    The ``mtime > latest_panic`` constraint blocks the "ack survived a new
+    panic" race: user touches ack at T, panic occurs at T+23h, reboot at
+    T+23.5h. Pure-TTL semantics would let the ack still pass, exactly when
+    the gate should be locked. Requiring ack newer than the latest panic
+    forces re-acknowledgement after every fresh panic.
+    """
+    ack_path = pathlib.Path(_PANIC_LOCKOUT_ACK_PATH)
+    if not ack_path.exists():
+        return False
+    try:
+        mtime = datetime.datetime.fromtimestamp(ack_path.stat().st_mtime)
+    except OSError:
+        return False
+    if (now - mtime) >= datetime.timedelta(hours=24):
+        return False
+    if latest_panic is not None and mtime < latest_panic:
+        return False
+    return True
+
+
+def _lockout_absolute_max_reached(
+    earliest_panic: datetime.datetime, now: datetime.datetime
+) -> bool:
+    """After ``METALGUARD_PANIC_LOCKOUT_MAX_H`` since earliest panic, auto-clear."""
+    max_h = _gate_env_float(_GATE_LOCKOUT_MAX_ENV, _GATE_LOCKOUT_MAX_DEFAULT_H)
+    return (now - earliest_panic) >= datetime.timedelta(hours=max_h)
+
+
+def evaluate_panic_cooldown(
+    *,
+    now: datetime.datetime | None = None,
+) -> CooldownVerdict:
+    """Evaluate whether the caller should defer Metal work right now.
+
+    Inspects ``/Library/Logs/DiagnosticReports/`` for AND-pattern IOGPU
+    panics within 72h, applies the staircase policy, and consults the
+    sentinel + ack files. Stdlib-only by design — works even when MLX is
+    wedged mid-recovery.
+
+    Kill switch: ``METALGUARD_PANIC_GATE_DISABLED=1`` short-circuits to
+    exit 0 unconditionally (used for emergency override).
+    """
+    now = now or datetime.datetime.now()
+
+    if os.environ.get(_GATE_KILL_SWITCH_ENV) == "1":
+        return CooldownVerdict(0, "kill-switch active", 0, 0, None)
+
+    sentinel_until = _read_panic_sentinel_until(now)
+    if sentinel_until is not None:
+        return CooldownVerdict(
+            2,
+            f"sentinel cooldown until {sentinel_until.isoformat(timespec='seconds')}",
+            0, 0, sentinel_until,
+        )
+
+    panics_72h = scan_recent_panics(72.0, now=now)
+    cutoff_24h = now - datetime.timedelta(hours=24)
+    panics_24h = [p for p in panics_72h if p.timestamp >= cutoff_24h]
+    count_24h = len(panics_24h)
+    count_72h = len(panics_72h)
+
+    hours = _staircase_cooldown_hours(count_24h, count_72h)
+
+    if hours is None:
+        return CooldownVerdict(0, "no recent IOGPU panics", count_24h, count_72h, None)
+
+    if hours < 0:
+        latest = panics_72h[0].timestamp if panics_72h else None
+        if _read_lockout_ack_valid(now, latest_panic=latest):
+            return CooldownVerdict(
+                0, "lockout cleared by ack", count_24h, count_72h, None,
+            )
+        # critic R1 P1-3 guard: if user sets METALGUARD_PANIC_LOCKOUT_72H_N=0
+        # the gate enters lockout-on-empty-list path. Default to "no auto-clear"
+        # (treat earliest as `now` so MAX_H window never elapses).
+        earliest = panics_72h[-1].timestamp if panics_72h else now
+        if _lockout_absolute_max_reached(earliest, now):
+            return CooldownVerdict(
+                0, "lockout absolute-max elapsed", count_24h, count_72h, None,
+            )
+        return CooldownVerdict(
+            2,
+            f"lockout: 24h={count_24h} 72h={count_72h}; "
+            f"touch {_PANIC_LOCKOUT_ACK_PATH} to clear",
+            count_24h, count_72h, None,
+        )
+
+    latest = panics_72h[0].timestamp
+    cooldown_until = latest + datetime.timedelta(hours=hours)
+    if cooldown_until > now:
+        return CooldownVerdict(
+            2,
+            f"cooldown {hours:.1f}h until {cooldown_until.isoformat(timespec='seconds')}",
+            count_24h, count_72h, cooldown_until,
+        )
+    return CooldownVerdict(
+        0,
+        f"cooldown expired (latest panic {latest.isoformat(timespec='seconds')})",
+        count_24h, count_72h, None,
+    )
+
+
+def mark_panic_sentinel_cooldown(
+    duration_hours: float,
+    *,
+    now: datetime.datetime | None = None,
+) -> pathlib.Path:
+    """Write a sentinel cooldown extending exit=2 for ``duration_hours``.
+
+    Atomic write (rename) so concurrent gate readers never see partial JSON.
+    Typically called by the postmortem collector (L12) right after writing
+    a bundle, to extend the cooldown beyond DiagnosticReports rotation lag.
+    """
+    now = now or datetime.datetime.now()
+    until = now + datetime.timedelta(hours=duration_hours)
+    path = pathlib.Path(_PANIC_SENTINEL_PATH)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = json.dumps({
+        "cooldown_until": until.isoformat(timespec="seconds"),
+        "created_at": now.isoformat(timespec="seconds"),
+    })
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, path)
+    return path
+
+
+def ack_panic_lockout() -> pathlib.Path:
+    """Touch ``~/.metal-guard-ack`` (atomic) to clear an active lockout.
+
+    Atomic rename so concurrent gate evaluations never read a half-written
+    ack. Operator should write a brief reason line into the file before
+    touching — future versions may mandate this content for audit.
+    """
+    ack = pathlib.Path(_PANIC_LOCKOUT_ACK_PATH)
+    tmp = ack.with_suffix(ack.suffix + ".pending")
+    tmp.write_text(datetime.datetime.now().isoformat(timespec="seconds") + "\n")
+    os.replace(tmp, ack)
+    return ack
+
+
+def clear_panic_ack() -> bool:
+    """Remove ``~/.metal-guard-ack``. Returns True if removed, False if absent."""
+    ack = pathlib.Path(_PANIC_LOCKOUT_ACK_PATH)
+    try:
+        ack.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning("metal-guard: clear_panic_ack failed: %s", exc)
+        return False
+
+
+def clear_panic_sentinel() -> bool:
+    """Remove the sentinel cooldown file."""
+    path = pathlib.Path(_PANIC_SENTINEL_PATH)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        log.warning("metal-guard: clear_panic_sentinel failed: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# L11 — Subprocess orphan monitor (C6 in Harper fork)
+# ---------------------------------------------------------------------------
+
+# Breadcrumb line format:
+#   [2026-04-23 17:39:43] SUBPROC_PRE: mlx-community/gemma-4-26b-a4b-8bit
+_BREADCRUMB_LINE_RE = re.compile(
+    r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] "
+    r"(?P<tag>[A-Z_0-9]+): (?P<payload>.*)$"
+)
+_WORKER_READY_RE = re.compile(
+    r"SUBPROCESS_WORKER: (?P<model>\S+) ready, pid=(?P<pid>\d+)"
+)
+
+_ORPHAN_KILL_SWITCH_ENV = "METALGUARD_SUBPROC_ORPHAN_WATCH_DISABLED"
+_ORPHAN_THRESHOLD_ENV = "METALGUARD_SUBPROC_ORPHAN_THRESHOLD_SEC"
+_ORPHAN_DEFAULT_THRESHOLD_SEC = 90.0
+_ORPHAN_TAIL_LINES = 2000
+
+
+@dataclass(frozen=True)
+class OrphanPre:
+    """A SUBPROC_PRE entry without a matching SUBPROC_POST after threshold."""
+    model_id: str
+    pre_ts: datetime.datetime
+    age_sec: float
+    pid: int | None  # from SUBPROCESS_WORKER ready line if traceable
+
+
+def _orphan_read_tail(path: pathlib.Path, n_lines: int) -> list[str]:
+    """Return last ``n_lines`` of ``path`` (cheap seek for large files)."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            if size < 1024 * 1024:
+                lines = f.readlines()
+            else:
+                approx_bytes = n_lines * 200
+                f.seek(max(0, size - approx_bytes))
+                _ = f.readline()  # discard partial line
+                lines = f.readlines()
+    except OSError as exc:
+        log.warning("metal-guard: cannot read %s: %s", path, exc)
+        return []
+    return lines[-n_lines:]
+
+
+def _orphan_parse_line(line: str) -> tuple[datetime.datetime, str, str] | None:
+    m = _BREADCRUMB_LINE_RE.match(line.strip())
+    if not m:
+        return None
+    try:
+        ts = datetime.datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+    return ts, m.group("tag"), m.group("payload")
+
+
+def scan_orphan_subproc_pre(
+    *,
+    threshold_sec: float | None = None,
+    now: datetime.datetime | None = None,
+    breadcrumb_path: str | None = None,
+) -> list[OrphanPre]:
+    """Return SUBPROC_PRE entries with no matching POST within threshold.
+
+    Pre-panic signal: SUBPROC_PRE without POST after 90s strongly suggests
+    Metal is stuck. Caller can then SIGKILL the offending worker pid before
+    the kernel does (saves a reboot).
+
+    Algorithm:
+        1. Read tail (~2000 lines) of breadcrumb log
+        2. Track latest WORKER_READY pid per model_id
+        3. FIFO-pair PRE↔POST per model_id
+        4. Unpaired PREs older than threshold are orphans
+
+    Disabled by ``METALGUARD_SUBPROC_ORPHAN_WATCH_DISABLED=1``.
+    """
+    if os.environ.get(_ORPHAN_KILL_SWITCH_ENV) == "1":
+        return []
+
+    if threshold_sec is None:
+        raw = os.environ.get(_ORPHAN_THRESHOLD_ENV, "").strip()
+        if raw:
+            try:
+                threshold_sec = float(raw)
+            except ValueError:
+                threshold_sec = _ORPHAN_DEFAULT_THRESHOLD_SEC
+        else:
+            threshold_sec = _ORPHAN_DEFAULT_THRESHOLD_SEC
+
+    now = now or datetime.datetime.now()
+    path_str = breadcrumb_path if breadcrumb_path is not None else (
+        metal_guard._breadcrumb_path or "logs/metal_breadcrumb.log"
+    )
+    path = pathlib.Path(os.path.expanduser(path_str))
+    if not path.exists():
+        return []
+
+    tail = _orphan_read_tail(path, _ORPHAN_TAIL_LINES)
+    pending: dict[str, list[datetime.datetime]] = {}
+    model_pid: dict[str, int] = {}
+
+    for line in tail:
+        parsed = _orphan_parse_line(line)
+        if parsed is None:
+            continue
+        ts, tag, payload = parsed
+        if tag == "SUBPROCESS_WORKER":
+            m = _WORKER_READY_RE.search(line)
+            if m:
+                model_pid[m.group("model")] = int(m.group("pid"))
+            continue
+        if tag == "SUBPROC_PRE":
+            model = payload.strip()
+            pending.setdefault(model, []).append(ts)
+        elif tag == "SUBPROC_POST":
+            model = payload.strip()
+            queue = pending.get(model)
+            if queue:
+                queue.pop(0)
+
+    cutoff = now - datetime.timedelta(seconds=threshold_sec)
+    orphans: list[OrphanPre] = []
+    for model, timestamps in pending.items():
+        for ts in timestamps:
+            if ts <= cutoff:
+                age = (now - ts).total_seconds()
+                orphans.append(OrphanPre(
+                    model_id=model,
+                    pre_ts=ts,
+                    age_sec=age,
+                    pid=model_pid.get(model),
+                ))
+    orphans.sort(key=lambda o: o.age_sec, reverse=True)
+    return orphans
+
+
+# ---------------------------------------------------------------------------
+# L12 — Postmortem auto-collect (C2 in Harper fork)
+# ---------------------------------------------------------------------------
+
+_POSTMORTEM_KILL_SWITCH_ENV = "METALGUARD_POSTMORTEM_DISABLED"
+_POSTMORTEM_SENTINEL_DURATION_ENV = "METALGUARD_POSTMORTEM_SENTINEL_H"
+_POSTMORTEM_SENTINEL_DURATION_DEFAULT_H = 2.0
+
+_POSTMORTEM_MAX_PANIC_FILES = 5
+_POSTMORTEM_MAX_BREADCRUMB_LINES = 500
+_POSTMORTEM_MAX_COPY_BYTES = 5 * 1024 * 1024  # 5MB cap per file
+
+
+def _postmortem_collect_panic_files(
+    output_dir: pathlib.Path,
+    *,
+    within_hours: float = 24.0,
+    now: datetime.datetime | None = None,
+) -> list[pathlib.Path]:
+    """Copy up to N IOGPU panic files into ``output_dir``."""
+    now = now or datetime.datetime.now()
+    records = scan_recent_panics(within_hours, now=now)[:_POSTMORTEM_MAX_PANIC_FILES]
+    copied: list[pathlib.Path] = []
+    for rec in records:
+        dest = output_dir / rec.path.name
+        try:
+            if rec.path.stat().st_size > _POSTMORTEM_MAX_COPY_BYTES:
+                with open(rec.path, "rb") as src, open(dest, "wb") as dst:
+                    dst.write(src.read(_POSTMORTEM_MAX_COPY_BYTES))
+                    dst.write(b"\n\n--- TRUNCATED at 5MB ---\n")
+            else:
+                shutil.copy2(rec.path, dest)
+            copied.append(dest)
+        except OSError as exc:
+            log.warning("metal-guard postmortem: copy %s failed: %s", rec.path, exc)
+    return copied
+
+
+def _postmortem_collect_breadcrumb(output_dir: pathlib.Path) -> pathlib.Path | None:
+    """Copy last N lines of breadcrumb log into ``output_dir``."""
+    breadcrumb_path = metal_guard._breadcrumb_path or "logs/metal_breadcrumb.log"
+    src = pathlib.Path(os.path.expanduser(breadcrumb_path))
+    if not src.exists():
+        return None
+    dest = output_dir / "breadcrumb_tail.log"
+    try:
+        with open(src, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        tail = lines[-_POSTMORTEM_MAX_BREADCRUMB_LINES:]
+        dest.write_text("".join(tail), encoding="utf-8")
+        return dest
+    except OSError as exc:
+        log.warning("metal-guard postmortem: breadcrumb tail failed: %s", exc)
+        return None
+
+
+def _postmortem_collect_panics_jsonl(output_dir: pathlib.Path) -> pathlib.Path | None:
+    """Copy panics.jsonl history (cross-ref panic ledger with this bundle)."""
+    src = pathlib.Path(_PANIC_JSONL_PATH)
+    if not src.exists():
+        return None
+    dest = output_dir / "panics.jsonl"
+    try:
+        shutil.copy2(src, dest)
+        return dest
+    except OSError as exc:
+        log.warning("metal-guard postmortem: panics.jsonl copy failed: %s", exc)
+        return None
+
+
+def _postmortem_collect_mlx_stats(output_dir: pathlib.Path) -> pathlib.Path:
+    """Best-effort mx.metal stats snapshot. File always written."""
+    dest = output_dir / "mlx_stats.txt"
+    try:
+        import mlx.core as mx  # type: ignore[import-not-found]
+    except ImportError as exc:
+        dest.write_text(f"mlx.core import failed: {exc}\n")
+        return dest
+    except Exception as exc:  # noqa: BLE001 — post-panic env may be wedged
+        dest.write_text(f"mlx.core import error: {type(exc).__name__}: {exc}\n")
+        return dest
+
+    lines: list[str] = []
+    # Try v0.32+ flat API first, fall back to legacy mx.metal namespace.
+    # critic R1 P1-1 fix: on exception, `continue` to legacy fallback rather
+    # than `break` — bug-by-bug API breakage shouldn't lose the whole stat.
+    for fn_name in ("get_active_memory", "get_cache_memory", "get_peak_memory"):
+        captured = False
+        for owner_name in ("mx", "mx.metal"):
+            owner = mx if owner_name == "mx" else getattr(mx, "metal", None)
+            if owner is None:
+                continue
+            fn = getattr(owner, fn_name, None)
+            if fn is None:
+                continue
+            try:
+                lines.append(f"{owner_name}.{fn_name}: {fn()}")
+                captured = True
+                break
+            except Exception as exc:  # noqa: BLE001
+                # Try next owner instead of giving up on this stat
+                lines.append(
+                    f"{owner_name}.{fn_name}: ERROR {type(exc).__name__}: {exc}"
+                )
+                continue
+        if not captured:
+            lines.append(f"{fn_name}: no working API path on this MLX version")
+    dest.write_text("\n".join(lines) + "\n")
+    return dest
+
+
+def _postmortem_write_index(
+    output_dir: pathlib.Path,
+    *,
+    now: datetime.datetime,
+    collected_panics: list[pathlib.Path],
+    breadcrumb: pathlib.Path | None,
+    panics_jsonl: pathlib.Path | None,
+    mlx_stats: pathlib.Path,
+) -> pathlib.Path:
+    """Write ``index.md`` summarising the bundle for human review."""
+    dest = output_dir / "index.md"
+    lines: list[str] = [
+        f"# metal-guard Postmortem {now.isoformat(timespec='seconds')}",
+        "",
+        "## Collected artifacts",
+        "",
+    ]
+    if collected_panics:
+        lines.append(f"### Panic files ({len(collected_panics)})")
+        for p in collected_panics:
+            try:
+                ts = datetime.datetime.fromtimestamp(p.stat().st_mtime).isoformat(
+                    timespec="seconds"
+                )
+            except OSError:
+                ts = "unknown"
+            lines.append(f"- `{p.name}` (mtime {ts})")
+        lines.append("")
+    else:
+        lines.append("### Panic files: NONE FOUND IN WINDOW")
+        lines.append("")
+    if breadcrumb:
+        lines.append(
+            f"### Breadcrumb tail: `{breadcrumb.name}` "
+            f"(last {_POSTMORTEM_MAX_BREADCRUMB_LINES} lines)"
+        )
+        lines.append("")
+    if panics_jsonl:
+        lines.append(f"### Panic JSONL history: `{panics_jsonl.name}`")
+        lines.append("")
+    lines.append(f"### MLX stats: `{mlx_stats.name}`")
+    lines.append("")
+    lines.append("## Next steps")
+    lines.append("")
+    lines.append(
+        "1. `grep -E 'SUBPROC_PRE|SUBPROC_POST|GEMMA4_FLUSH' breadcrumb_tail.log` "
+        "to trace last MLX ops before panic"
+    )
+    lines.append(
+        "2. `grep 'IOGPUMemory' *.panic` to confirm signature"
+    )
+    lines.append(
+        "3. If panic was on a specific model, file a Known Panic Model report: "
+        "https://github.com/Harperbot/metal-guard/issues/new?template=known-panic-report.yml"
+    )
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return dest
+
+
+def run_postmortem(
+    output_dir: pathlib.Path | str,
+    *,
+    now: datetime.datetime | None = None,
+) -> dict[str, Any]:
+    """Orchestrate full postmortem collection.
+
+    When at least one IOGPU panic is found inside the 24h window, a
+    sentinel cooldown is also written so L10's gate keeps deferring runs
+    even if the DiagnosticReports rotation races the next plist start.
+
+    Kill-switch: ``METALGUARD_POSTMORTEM_DISABLED=1`` short-circuits.
+
+    Returns a dict with keys: ``status`` (``"collected"`` / ``"disabled"``),
+    ``output_dir``, ``panic_count``, ``index`` (path), ``sentinel`` (path or None).
+    """
+    if os.environ.get(_POSTMORTEM_KILL_SWITCH_ENV) == "1":
+        return {"status": "disabled", "output_dir": str(output_dir)}
+    now = now or datetime.datetime.now()
+    output_dir = pathlib.Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    panics = _postmortem_collect_panic_files(output_dir, now=now)
+    breadcrumb = _postmortem_collect_breadcrumb(output_dir)
+    jsonl = _postmortem_collect_panics_jsonl(output_dir)
+    stats = _postmortem_collect_mlx_stats(output_dir)
+    index = _postmortem_write_index(
+        output_dir,
+        now=now,
+        collected_panics=panics,
+        breadcrumb=breadcrumb,
+        panics_jsonl=jsonl,
+        mlx_stats=stats,
+    )
+
+    # Extend cooldown if we actually saw a panic — prevents the gate from
+    # re-opening before the human has a chance to look at the bundle.
+    sentinel_path: str | None = None
+    if panics:
+        try:
+            raw = os.environ.get(_POSTMORTEM_SENTINEL_DURATION_ENV)
+            duration = float(raw) if raw else _POSTMORTEM_SENTINEL_DURATION_DEFAULT_H
+        except ValueError:
+            duration = _POSTMORTEM_SENTINEL_DURATION_DEFAULT_H
+        try:
+            sentinel_path = str(mark_panic_sentinel_cooldown(duration, now=now))
+        except OSError as exc:
+            log.warning("metal-guard postmortem: sentinel write failed: %s", exc)
+
+    return {
+        "status": "collected",
+        "output_dir": str(output_dir),
+        "panic_count": len(panics),
+        "index": str(index),
+        "sentinel": sentinel_path,
+    }
+
+
+# ---------------------------------------------------------------------------
+# L13 — Status snapshot writer (Harper-private status_api + status_writer)
+# ---------------------------------------------------------------------------
+
+STATUS_SNAPSHOT_SCHEMA_VERSION = "1.0"
+_STATUS_SNAPSHOT_DEFAULT_PATH = os.path.expanduser(
+    "~/.cache/metal-guard/status.json"
+)
+_STATUS_WRITER_DEFAULT_INTERVAL_S = 30.0
+
+
+def get_status_snapshot(
+    *,
+    include_panics: bool = True,
+    breadcrumb_lines: int = 20,
+) -> dict[str, Any]:
+    """Build a versioned JSON-serialisable snapshot of metal-guard state.
+
+    Designed for cross-process consumers (menu bar apps, dashboards, ssh
+    inspection scripts) that should not import ``metal_guard`` directly.
+    Schema is append-only across minor versions; breaking changes bump
+    ``STATUS_SNAPSHOT_SCHEMA_VERSION``.
+
+    Top-level keys:
+        - ``schema_version``
+        - ``captured_at`` (ISO-8601 UTC)
+        - ``memory`` (active/peak/limit/available + pct)
+        - ``kv_monitor`` (running, interval, samples, growth_rate)
+        - ``recent_panics`` (signature/time/explanation list)
+        - ``breadcrumb_tail`` (last N lines of metal_breadcrumb.log)
+        - ``lock`` (held + holder details from cross-process file lock)
+        - ``mode`` (defensive / observer)
+        - ``panic_cooldown`` (exit_code / reason / 24h+72h counts)
+        - ``errors`` (only when a sub-collector failed; never raises)
+    """
+    snapshot: dict[str, Any] = {
+        "schema_version": STATUS_SNAPSHOT_SCHEMA_VERSION,
+        "captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "errors": {},
+    }
+
+    # 1a. Memory stats — public MetalGuard.memory_stats() returns MemoryStats
+    #     (or zero MemoryStats when MLX not importable, e.g. running outside
+    #     a venv with mlx installed). critic R1 P0-2 fix.
+    try:
+        stats = metal_guard.memory_stats()
+        if stats.limit_bytes > 0:
+            snapshot["memory"] = {
+                "available": True,
+                "active_gb": round(stats.active_gb, 3),
+                "peak_gb": round(stats.peak_gb, 3),
+                "limit_gb": round(stats.limit_gb, 3),
+                "available_gb": round(stats.available_gb, 3),
+                "active_pct": round(stats.active_pct, 1),
+                "peak_pct": round(stats.peak_pct, 1),
+            }
+        else:
+            # MLX not loaded / no Metal device; surface but don't error.
+            snapshot["memory"] = {"available": False, "reason": "mlx not loaded"}
+    except Exception as exc:  # noqa: BLE001
+        snapshot["memory"] = {"available": False}
+        snapshot["errors"]["memory"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    # 1b. KV growth tracker live state (module-level singleton)
+    try:
+        snapshot["kv_monitor"] = {
+            "running": True,
+            "active_requests": kv_tracker.snapshot(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        snapshot["kv_monitor"] = {"running": False}
+        snapshot["errors"]["kv_monitor"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    # 1c. Recent panics via existing public parser
+    if include_panics:
+        try:
+            since_ts = time.time() - 72 * 3600.0
+            snapshot["recent_panics"] = parse_panic_reports(since_ts=since_ts) or []
+        except Exception as exc:  # noqa: BLE001
+            snapshot["recent_panics"] = []
+            snapshot["errors"]["recent_panics"] = f"{type(exc).__name__}: {exc}"[:200]
+    else:
+        snapshot["recent_panics"] = []
+
+    # 1d. Breadcrumb tail
+    if breadcrumb_lines > 0:
+        try:
+            bc_path = metal_guard._breadcrumb_path or "logs/metal_breadcrumb.log"
+            bc_full = pathlib.Path(os.path.expanduser(bc_path))
+            if bc_full.is_file():
+                with bc_full.open("r", encoding="utf-8", errors="replace") as fh:
+                    lines = fh.readlines()
+                snapshot["breadcrumb_path"] = str(bc_full)
+                snapshot["breadcrumb_tail"] = [
+                    ln.rstrip() for ln in lines[-breadcrumb_lines:]
+                ]
+            else:
+                snapshot["breadcrumb_path"] = None
+                snapshot["breadcrumb_tail"] = []
+        except OSError as exc:
+            snapshot["breadcrumb_tail"] = []
+            snapshot["errors"]["breadcrumb"] = f"{type(exc).__name__}: {exc}"[:200]
+    else:
+        snapshot["breadcrumb_tail"] = []
+
+    # 2. Lock holder
+    try:
+        lock_info = read_mlx_lock()
+        if lock_info:
+            started = lock_info.get("started_at")
+            elapsed: float | None = None
+            if isinstance(started, str):
+                try:
+                    started_dt = datetime.datetime.fromisoformat(
+                        started.replace("Z", "+00:00")
+                    )
+                    elapsed = (
+                        datetime.datetime.now(datetime.timezone.utc) - started_dt
+                    ).total_seconds()
+                except (ValueError, TypeError):
+                    pass
+            snapshot["lock"] = {
+                "held": True,
+                "pid": lock_info.get("pid"),
+                "label": lock_info.get("label"),
+                "started_at": started,
+                "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
+                "cmdline": (lock_info.get("cmdline") or "")[:500],
+                "host": lock_info.get("host"),
+            }
+        else:
+            snapshot["lock"] = {"held": False}
+    except Exception as exc:  # noqa: BLE001
+        snapshot["lock"] = {"held": False, "available": False}
+        snapshot["errors"]["lock"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    # 3. Mode
+    try:
+        mode_desc = describe_mode()  # returns dict[str, str]
+        snapshot["mode"] = {
+            "current": current_mode(),
+            "env_var": "METALGUARD_MODE",
+            "description": mode_desc.get("description", ""),
+            "details": mode_desc,
+        }
+    except Exception as exc:  # noqa: BLE001
+        snapshot["mode"] = {"current": "unknown"}
+        snapshot["errors"]["mode"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    # 4. L10 panic cooldown verdict
+    try:
+        verdict = evaluate_panic_cooldown()
+        snapshot["panic_cooldown"] = {
+            "exit_code": verdict.exit_code,
+            "reason": verdict.reason,
+            "recent_panics_24h": verdict.recent_panics_24h,
+            "recent_panics_72h": verdict.recent_panics_72h,
+            "cooldown_until": (
+                verdict.cooldown_until.isoformat(timespec="seconds")
+                if verdict.cooldown_until else None
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        snapshot["panic_cooldown"] = {"available": False}
+        snapshot["errors"]["panic_cooldown"] = f"{type(exc).__name__}: {exc}"[:200]
+
+    if not snapshot["errors"]:
+        del snapshot["errors"]
+    return snapshot
+
+
+def write_status_snapshot(
+    out_path: pathlib.Path | str | None = None,
+) -> pathlib.Path:
+    """Atomic snapshot write to ``out_path`` (default ``~/.cache/metal-guard/status.json``).
+
+    Atomic via ``tmp.write + os.replace`` so concurrent readers never see
+    a partial JSON payload.
+    """
+    out_path = pathlib.Path(out_path or _STATUS_SNAPSHOT_DEFAULT_PATH)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    snap = get_status_snapshot()
+    tmp = out_path.with_suffix(out_path.suffix + f".tmp.{os.getpid()}")
+    try:
+        tmp.write_text(
+            json.dumps(snap, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        os.replace(tmp, out_path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return out_path

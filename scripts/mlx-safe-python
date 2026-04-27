@@ -1,0 +1,120 @@
+#!/bin/bash
+# mlx-safe-python — interactive Python wrapper that respects metal-guard L10
+# panic cooldown gate. Refuses ad-hoc `python -c "import torch/mlx/..."` while
+# a cooldown is active so post-panic shells don't accidentally re-trigger the
+# IOGPUFamily driver bug (Apple mlx#3186 / mlx#3346).
+#
+# Background:
+#   metal-guard's launchd-plist wrappers gate every scheduled MLX run through
+#   `python -m metal_guard.cli panic-gate` (rc=0 proceed / rc=2 cooldown).
+#   But ad-hoc shell invocations (`python -c "import sentence_transformers"`
+#   for upgrade verification, pip wheel builds, daemon restart probes) bypass
+#   the gate entirely. Short-lived Python processes that import torch/mlx
+#   teardown MPS in a way that triggers the same kernel panic — cooldowns
+#   exist precisely to give the kernel time to settle, and you do NOT want
+#   to short-circuit them by hand.
+#
+# This wrapper:
+#   1. runs the L10 gate
+#   2. if cooldown active, refuses ad-hoc `python -c` / `python script.py`
+#      with rc=10 and a clear stderr message
+#   3. allows pip / build tooling to pass through (they don't import Metal)
+#   4. provides MLX_SAFE_PYTHON_FORCE=1 escape hatch with WARN
+#   5. fail-open (rc=11 + WARN) if the gate itself is broken — never
+#      blocks shell on infrastructure problems
+#
+# Usage:
+#   mlx-safe-python -c "import sentence_transformers; print(...)"
+#   mlx-safe-python -m pip show sentence-transformers
+#   MLX_SAFE_PYTHON_FORCE=1 mlx-safe-python -c "..."
+#
+# Exit codes:
+#   0   ran python successfully (or cooldown absent)
+#   10  blocked by cooldown (set MLX_SAFE_PYTHON_FORCE=1 to override)
+#   11  panic_gate itself broken (fail-open: runs python anyway, WARN)
+#   127 python binary not found
+#
+# Env:
+#   MLX_SAFE_PYTHON_BIN              python binary to invoke (default `which python3`)
+#   MLX_SAFE_PYTHON_MODULE           override `metal_guard.cli` module path
+#   MLX_SAFE_PYTHON_FORCE=1          run despite cooldown
+#   METALGUARD_PANIC_GATE_DISABLED=1 disables the gate itself
+#
+# Single-file bash, stdlib only — safe to run during panic recovery when pip
+# state may be inconsistent. Tested on Bash 3.2 (macOS default) and Bash 5+.
+set -eu
+
+PYTHON_BIN="${MLX_SAFE_PYTHON_BIN:-$(command -v python3 || true)}"
+# critic R1 P0-1 fix: public single-file module is `metal_guard_cli` (NOT
+# `metal_guard.cli` — metal_guard.py is a single-file module, not a package).
+# `pyproject.toml` console-script: `metal-guard = "metal_guard_cli:main"`.
+GATE_MODULE="${MLX_SAFE_PYTHON_MODULE:-metal_guard_cli}"
+
+if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
+    echo "[mlx-safe-python] FATAL: no python3 on PATH (or MLX_SAFE_PYTHON_BIN=$PYTHON_BIN not executable)" >&2
+    exit 127
+fi
+
+# Pip / build / venv tooling does not import torch / mlx at CLI level — let
+# these pass without gate-blocking so `pip install` in cooldown doesn't push
+# users to reflexively `FORCE=1` and erode SOP discipline. Strict match: only
+# bypass when argv[1]=="-m" AND argv[2] is in the allowlist (avoids false-
+# bypass when a script path or flag happens to contain the word "pip").
+_is_safe_module=0
+if [[ "${1:-}" == "-m" ]] && [[ -n "${2:-}" ]]; then
+    case "$2" in
+        pip|pip3|pip3.[0-9]*|build|virtualenv|venv|ensurepip|tomllib)
+            _is_safe_module=1
+            ;;
+    esac
+fi
+if [[ $_is_safe_module -eq 1 ]]; then
+    exec "$PYTHON_BIN" "$@"
+fi
+
+# Run the gate. Capture exit code separately to avoid set -e short-circuit.
+# Gate prints a JSON line / human verdict; redirect to stderr so caller's
+# stdout stays clean.
+set +e
+gate_output=$("$PYTHON_BIN" -m "$GATE_MODULE" panic-gate 2>&1)
+gate_rc=$?
+set -e
+
+case $gate_rc in
+    0)
+        # Proceed silently — no cooldown.
+        ;;
+    2)
+        # Cooldown active.
+        if [[ "${MLX_SAFE_PYTHON_FORCE:-0}" == "1" ]]; then
+            echo "[mlx-safe-python] WARN: cooldown active, proceeding due to MLX_SAFE_PYTHON_FORCE=1" >&2
+            echo "[mlx-safe-python] gate says: $gate_output" >&2
+        else
+            echo "[mlx-safe-python] BLOCKED: metal-guard panic cooldown is active." >&2
+            echo "[mlx-safe-python] gate says: $gate_output" >&2
+            echo "[mlx-safe-python] To override for a single invocation:" >&2
+            echo "    MLX_SAFE_PYTHON_FORCE=1 mlx-safe-python $*" >&2
+            echo "[mlx-safe-python] To verify package versions WITHOUT importing, prefer:" >&2
+            echo "    pip show <package>" >&2
+            echo "    python -c 'import importlib.metadata; print(importlib.metadata.version(\"<pkg>\"))'" >&2
+            exit 10
+        fi
+        ;;
+    *)
+        # Gate itself broken → fail-open WARN.
+        echo "[mlx-safe-python] WARN: panic-gate broken (rc=$gate_rc), proceeding fail-open" >&2
+        echo "[mlx-safe-python] gate says: $gate_output" >&2
+        ;;
+esac
+
+# Cooldown-bypass / fail-open path: harden the spawned python.
+#   PYTHONNOUSERSITE=1     skip user-site .pth + usercustomize injection
+#   PYTORCH_ENABLE_MPS_FALLBACK=0  force CPU if torch is the import target
+# Note: MPS init still happens during `import torch`. This is defence-in-
+# depth, not a fix.
+if [[ $gate_rc -ne 0 ]]; then
+    export PYTHONNOUSERSITE=1
+    export PYTORCH_ENABLE_MPS_FALLBACK=0
+fi
+
+exec "$PYTHON_BIN" "$@"

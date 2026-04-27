@@ -6,7 +6,33 @@ Apple Silicon 上 [MLX](https://github.com/ml-explore/mlx) 的 GPU 安全層。
 
 防止 MLX 推論時 Metal 驅動程式 bug 造成的 kernel panic 與 OOM 崩潰 —— 尤其是多模型 pipeline、長時間運行的 server、以及大量 tool calling 的 agent 框架。
 
-**當前版本：** v0.9.0 — 發行歷史與每個功能的背景見 [CHANGELOG.md](CHANGELOG.md)。v0.9.0 新增 `subprocess_inference_guard`（B1）、跨模型 cadence + gemma-4 90 秒下限（C5）、`gemma4_generation_flush`（C7）、以及 `KNOWN_PANIC_MODELS` advisory 登記表。
+**當前版本：v0.10.0** — 發行歷史與每個功能的背景見 [CHANGELOG.md](CHANGELOG.md)。
+
+### v0.10 帶來什麼
+
+metal-guard 現在涵蓋 Apple Silicon kernel panic 的**完整生命週期** —— panic 之前、之中、之後：
+
+| 階段 | Layer | 作用 |
+|---|---|---|
+| 之前 | L1–L9（v0.1–v0.9） | thread 追蹤 / cleanup / OOM 復原 / 載入前檢查 / 長跑安全 / dual-mode / subprocess 隔離 / cross-process lock / cadence + circuit breaker |
+| **重開後（新）** | **L10 panic cooldown gate** | panic 後 2h–72h 拒絕重啟 MLX 工作 — launchd 自動 respawn plist 時不會立刻再 panic |
+| **panic 前警告（新）** | **L11 subprocess orphan monitor** | 偵測 `SUBPROC_PRE` 沒有對應 `SUBPROC_POST` 超過 90s — 在 kernel 殺 worker 之前先 SIGKILL |
+| **重開後（新）** | **L12 postmortem auto-collect** | 把 `panic-full-*.panic` + breadcrumb 尾段 + `mx.metal` 統計 + `index.md` 摘要打包進一個目錄 |
+| **跨程序狀態（新）** | **L13 status snapshot** | versioned JSON 給 menu bar / dashboard / ssh 巡檢消費 —— 下游不需 `import metal_guard` |
+| 全 layer | **`KNOWN_PANIC_MODELS` 登記表** | 社群共筆 `(model, 硬體, panic 簽名, workload, workaround)` 資料 —— 見下方 [社群 panic 模型登記表](#-社群-panic-模型登記表--known_panic_models) |
+
+v0.10 帶來的新 CLI：
+
+```bash
+metal-guard panic-gate            # L10: rc=0 通過 / rc=2 cooldown / rc≥3 gate 壞
+metal-guard postmortem ./bundle   # L12: 重開後採集
+metal-guard status-write --once   # L13: 寫 JSON snapshot
+metal-guard orphan-scan           # L11: pre-panic stuck-worker 偵測
+metal-guard ack                   # L10: 清 lockout（必須 user 親手）
+mlx-safe-python -c "import torch" # 互動 shell 守衛 — cooldown 中拒 ad-hoc import
+```
+
+v0.10 把 Harper 私用 fork 內 4 個防線在 production 驗證兩週、跨 11 次 panic 後 promote 到公開版。從早期版本就有的誠實 caveat 仍適用：metal-guard 縮的是 Apple IOGPU driver bug 周圍的 race window —— 它**沒修** bug 本身。v0.10 把防禦面從「執行中」擴到「重開後」+「kernel kill 之前」。
 
 ## 搜這些字串跑來的？你來對地方了。
 

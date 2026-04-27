@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metal-guard"
-version = "0.9.0"
-description = "GPU safety layer for MLX on Apple Silicon — prevents kernel panics from Metal driver bugs"
+version = "0.10.0"
+description = "GPU safety layer for MLX on Apple Silicon — prevents kernel panics from Metal driver bugs, includes community-curated KNOWN_PANIC_MODELS registry"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -27,9 +27,18 @@ classifiers = [
 mlx = ["mlx>=0.20"]
 test = ["pytest>=7.0"]
 
+[project.scripts]
+# Phase 4 spec section 6 第 2 項：standalone CLI 給 PyPI 用戶用
+metal-guard = "metal_guard_cli:main"
+# v0.10 — interactive shell guard (replaces scripts/mlx-safe-python bash for
+# pip users; bash wrapper kept in source tree for non-pip installs).
+mlx-safe-python = "metal_guard_cli:safe_python_main"
+
 [project.urls]
-Repository = "https://github.com/harper-systems/metal-guard"
-Issues = "https://github.com/harper-systems/metal-guard/issues"
+Repository = "https://github.com/Harperbot/metal-guard"
+Issues = "https://github.com/Harperbot/metal-guard/issues"
+Changelog = "https://github.com/Harperbot/metal-guard/blob/main/CHANGELOG.md"
+"Known Panic Models" = "https://github.com/Harperbot/metal-guard#-community-panic-registry--known_panic_models"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

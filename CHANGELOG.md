@@ -5,6 +5,103 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.10.0] — 2026-04-27
+
+Promotes four Harper-private defence layers (`L10`-`L13`) to the public
+distribution after two weeks of production validation, and reframes
+`KNOWN_PANIC_MODELS` as a community-curated registry.
+
+### Added
+
+- **L10 — Panic cooldown gate** (`evaluate_panic_cooldown` / `mark_panic_sentinel_cooldown` /
+  `ack_panic_lockout` / `clear_panic_ack` / `clear_panic_sentinel`). After a kernel panic +
+  reboot, launchd auto-respawns plists ~14 minutes later — without a gate, the next MLX
+  workload can immediately re-trigger the same driver bug. The gate scans
+  `/Library/Logs/DiagnosticReports/` for AND-pattern (`prepare_count_underflow` +
+  `IOGPUMemory.cpp:NNN`) panics and applies a staircase cooldown:
+
+  | 24h panics | Action |
+  |---|---|
+  | 0 | proceed |
+  | 1 | 2h cooldown since latest panic |
+  | ≥2 (or 72h ≥3) | lockout — requires `~/.metal-guard-ack` touch |
+
+  Returns a `CooldownVerdict` dataclass with `exit_code` ∈ {0=proceed, 2=cooldown,
+  ≥3=gate broken}. Stdlib-only by design — works even when MLX install is wedged
+  mid-recovery. Designed for plist wrapper scripts via the `metal-guard panic-gate` CLI.
+
+  Env knobs: `METALGUARD_PANIC_COOLDOWN_STAGE1_H` / `_LOCKOUT_24H_N` / `_LOCKOUT_72H_N` /
+  `_LOCKOUT_MAX_H` / `_GATE_DISABLED=1` (kill switch).
+
+- **L11 — Subprocess orphan monitor** (`scan_orphan_subproc_pre`, `OrphanPre`
+  dataclass). Pre-panic signal: a `SUBPROC_PRE: <model>` breadcrumb without a
+  matching `SUBPROC_POST` after 90 seconds strongly suggests Metal is stuck.
+  Caller can then SIGKILL the worker pid before the kernel does (saves a
+  reboot). Reads breadcrumb tail (~2000 lines) and FIFO-pairs PRE↔POST per
+  model_id. Configurable threshold via `METALGUARD_SUBPROC_ORPHAN_THRESHOLD_SEC`,
+  kill-switch `METALGUARD_SUBPROC_ORPHAN_WATCH_DISABLED=1`.
+
+- **L12 — Postmortem auto-collect** (`run_postmortem(output_dir)`). After a
+  panic + reboot, this collects the full diagnostic bundle:
+    - panic-full-*.panic files within 24h (capped at 5 files / 5MB each)
+    - last 500 lines of metal_breadcrumb.log
+    - panics.jsonl history copy
+    - mx.metal.{active,cache,peak}_memory snapshot (best-effort if MLX importable)
+    - `index.md` summarising the bundle + next steps
+
+  When a panic is found in the window, also writes a sentinel cooldown so L10
+  defers further runs even if DiagnosticReports rotates. Kill-switch
+  `METALGUARD_POSTMORTEM_DISABLED=1`. Designed to be called from a launchd
+  wrapper after reboot.
+
+- **L13 — Status snapshot writer** (`get_status_snapshot` / `write_status_snapshot`).
+  JSON snapshot for cross-process consumers (menu bar apps, dashboards, ssh
+  inspection scripts) that should not import `metal_guard` directly. Schema
+  is append-only across minor versions; breaking changes bump
+  `STATUS_SNAPSHOT_SCHEMA_VERSION`. Aggregates: memory stats / KV monitor
+  state / recent panics / breadcrumb tail / cross-process lock holder /
+  defensive-vs-observer mode / L10 cooldown verdict. Atomic write via
+  `tmp + os.replace`. Daemon mode via `metal-guard status-write --interval 30`.
+
+- **CLI subcommands** in `metal-guard` console script (matches Harper's
+  internal CLI surface):
+    - `metal-guard panic-gate` — L10 evaluate, exit 0/2/3 for plist wrappers
+    - `metal-guard postmortem <output_dir>` — L12 collect bundle
+    - `metal-guard status-write [--once|--interval N]` — L13 atomic write / daemon
+    - `metal-guard orphan-scan [--threshold-sec N]` — L11 scan
+    - `metal-guard ack` — L10 atomic touch `~/.metal-guard-ack`
+
+- **`scripts/mlx-safe-python`** bash wrapper — interactive shell guard that
+  refuses ad-hoc `python -c "import torch/mlx"` while a cooldown is active.
+  Lets `pip` / `build` / `venv` / `ensurepip` pass through (they don't import
+  Metal). Provides `MLX_SAFE_PYTHON_FORCE=1` escape hatch with WARN. Fail-open
+  if the gate itself is broken (rc=11 + stderr WARN, never blocks shell on
+  infrastructure problems). Generic — works with any python3 on PATH.
+
+### Changed
+
+- **`KNOWN_PANIC_MODELS` is now framed as a community-curated registry.**
+  README has a prominent section above "The Problem" pitching it as the
+  canonical place to record `(model, hardware, panic signature, workload,
+  workaround)` tuples. New `.github/ISSUE_TEMPLATE/known-panic-report.yml`
+  walks contributors through the schema. New `CONTRIBUTING.md` documents
+  required vs. optional fields, quality bar (production reproduction OR
+  confirmed upstream issue with signature), and an example entry.
+
+- **Default state path is `~/.cache/metal-guard/`** for L10's sentinel and
+  panics.jsonl ledger. User-facing ack file is `~/.metal-guard-ack` (single-
+  `touch` clearance without spelunking caches). XDG-compatible.
+
+- **PyPI URLs corrected** to `Harperbot/metal-guard`. Added `Changelog` and
+  `Known Panic Models` URL entries for PyPI display.
+
+### Notes
+
+The honest caveat from v0.9.0 still holds: metal-guard narrows multiple race
+windows around the Apple IOGPU driver bug — it does not fix the bug. v0.10
+extends the defence surface from "during run" to "after reboot" (L10 prevents
+auto-re-panic, L12 captures forensics, L13 surfaces state to monitoring).
+
 ## [0.9.0] — 2026-04-25
 
 Minor release consolidating **panic #7–#11 findings** from Harper's

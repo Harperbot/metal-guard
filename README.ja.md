@@ -6,7 +6,33 @@ Apple Silicon 上で [MLX](https://github.com/ml-explore/mlx) を動かすため
 
 MLX 推論中に Metal ドライバーのバグが引き起こすカーネルパニックや OOM クラッシュを防止します —— 特にマルチモデルパイプライン、長時間稼働サーバー、ツール呼び出しが多いエージェントフレームワークを想定しています。
 
-**現在のバージョン：** v0.9.0 — リリース履歴と各機能の背景は [CHANGELOG.md](CHANGELOG.md) を参照してください。v0.9.0 では `subprocess_inference_guard`（B1）、cross-model cadence + gemma-4 90 秒フロア（C5）、`gemma4_generation_flush`（C7）、および `KNOWN_PANIC_MODELS` アドバイザリレジストリを追加しました。
+**現在のバージョン：v0.10.0** — リリース履歴と各機能の背景は [CHANGELOG.md](CHANGELOG.md) を参照してください。
+
+### v0.10 で追加されたもの
+
+metal-guard は Apple Silicon カーネルパニックの**ライフサイクル全体** —— パニック前・最中・後 —— をカバーするようになりました：
+
+| フェーズ | Layer | 役割 |
+|---|---|---|
+| 前 | L1–L9（v0.1–v0.9） | スレッド追跡 / クリーンアップ / OOM リカバリ / プリロードチェック / 長期稼働セーフティ / dual-mode / サブプロセス隔離 / クロスプロセスロック / cadence + circuit breaker |
+| **再起動後（新）** | **L10 panic cooldown gate** | パニック後 2h–72h は MLX ワーク再開を拒否 —— launchd が plist を自動 respawn しても即時再パニックを防ぐ |
+| **パニック前警告（新）** | **L11 subprocess orphan monitor** | `SUBPROC_PRE` に対応する `SUBPROC_POST` が 90 秒たってもない場合 —— カーネルが worker を殺す前に SIGKILL |
+| **再起動後（新）** | **L12 postmortem auto-collect** | `panic-full-*.panic` + breadcrumb 末尾 + `mx.metal` 統計 + `index.md` サマリを 1 ディレクトリにバンドル |
+| **クロスプロセス状態（新）** | **L13 status snapshot** | versioned JSON をメニューバー / ダッシュボード / ssh インスペクション向けに公開 —— 下流は `import metal_guard` 不要 |
+| 全レイヤー | **`KNOWN_PANIC_MODELS` レジストリ** | コミュニティキュレーションの `(model, ハードウェア, panic シグネチャ, ワークロード, ワークアラウンド)` データ —— 下記 [コミュニティ panic モデルレジストリ](#-コミュニティ-panic-モデルレジストリ--known_panic_models) 参照 |
+
+v0.10 が同梱する新しい CLI：
+
+```bash
+metal-guard panic-gate            # L10: rc=0 進行 / rc=2 cooldown / rc≥3 gate 故障
+metal-guard postmortem ./bundle   # L12: 再起動後の収集
+metal-guard status-write --once   # L13: JSON スナップショットを書く
+metal-guard orphan-scan           # L11: pre-panic stuck-worker 検出
+metal-guard ack                   # L10: lockout を解除（user の明示的 touch 必須）
+mlx-safe-python -c "import torch" # 対話シェルガード — cooldown 中の ad-hoc import を拒否
+```
+
+v0.10 は Harper のプライベートフォークで 2 週間・11 件のパニックインシデントを経て本番検証された 4 つの防御層を公開版にプロモーションしたものです。以前のリリースから持ち越している正直な注意事項はそのまま生きています：metal-guard は Apple IOGPU ドライバーバグのレースウィンドウを狭めるだけで、**バグ自体は修正しません**。v0.10 は防御面を「実行中」から「再起動後」+「カーネル kill の直前」へ拡張します。
 
 ## 以下のキーワードで辿り着いた方、ここが答えです。
 
