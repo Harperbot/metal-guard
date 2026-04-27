@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metal-guard"
-version = "0.11.3"
+version = "0.11.4"
 description = "GPU safety layer for MLX on Apple Silicon — prevents kernel panics from Metal driver bugs, includes community-curated KNOWN_PANIC_MODELS registry"
 readme = "README.md"
 license = "MIT"

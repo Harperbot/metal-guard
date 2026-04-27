@@ -416,3 +416,54 @@ def test_scan_recent_aborts_dedupes_overlapping_globs(monkeypatch, tmp_path):
     )
     aborts = mg.scan_recent_aborts(24.0)
     assert len(aborts) == 1  # not 2
+
+
+# ─── v0.11.4: MLX_VERSION_BLOCKLIST + 2026-04-28 panic registry additions ─
+
+
+def test_mlx_version_blocklist_known_entry():
+    block = mg.check_mlx_version_blocked("0.31.2")
+    assert block is not None
+    assert block["severity"] == "critical"
+    assert "SIGSEGV" in block["signature"] or "segfault" in block["reason"].lower()
+    assert block["upstream"][0].startswith("https://github.com/ml-explore/mlx")
+
+
+def test_mlx_version_blocklist_unknown_returns_none():
+    assert mg.check_mlx_version_blocked("0.31.1") is None
+    assert mg.check_mlx_version_blocked("0.32.0") is None
+    assert mg.check_mlx_version_blocked("") is None
+
+
+def test_mlx_version_blocklist_schema_sanity():
+    """Lock required fields on every blocklist entry."""
+    required = {"severity", "error_class", "signature", "reason",
+                "first_observed", "upstream", "workaround"}
+    allowed_severity = {"critical", "high", "medium"}
+    for ver, e in mg.MLX_VERSION_BLOCKLIST.items():
+        missing = required - set(e.keys())
+        assert not missing, f"MLX {ver}: blocklist entry missing {missing}"
+        assert e["severity"] in allowed_severity, (
+            f"MLX {ver}: severity={e['severity']!r} not in {allowed_severity}"
+        )
+        assert e["upstream"], f"MLX {ver}: upstream must be non-empty"
+
+
+def test_v0114_new_panic_registry_entries_present():
+    """Sanity that the 2026-04-28 sweep entries landed in the registry."""
+    expected = {
+        "mlx-community/Qwen3.5-122B-A10B-VLM-MTP-5bit",
+        "mlx-community/Qwen3-Coder-Next-4bit",
+        "mlx-community/Qwen3.5-9B-4bit",
+        "mlx-community/Qwen3.6-35B-A3B-VLM-MTP-8bit",
+        "mlx-community/kimi-k2.5",
+    }
+    missing = expected - set(mg.KNOWN_PANIC_MODELS.keys())
+    assert not missing, f"v0.11.4 sweep entries missing: {missing}"
+
+
+def test_v0114_silent_corruption_error_class_recorded():
+    """The Qwen3.6 VLM-as-text entry uses the new silent_corruption type."""
+    e = mg.KNOWN_PANIC_MODELS["mlx-community/Qwen3.6-35B-A3B-VLM-MTP-8bit"]
+    types = {ec["type"] for ec in e["error_classes"]}
+    assert "silent_corruption" in types

@@ -85,7 +85,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.11.3"
+__version__ = "0.11.4"
 
 log = logging.getLogger("metal_guard")
 
@@ -5144,7 +5144,203 @@ KNOWN_PANIC_MODELS: dict[str, dict[str, Any]] = {
         ),
         "upstream": ["https://github.com/Blaizzy/mlx-vlm/issues/1064"],
     },
+
+    # ─── v0.11.4 additions: 2026-04-28 community sweep ───
+    # Sources: ml-explore/mlx#3457 / mlx-lm#1206 #1208 #1197 / mlx-lm#1047
+    "mlx-community/Qwen3.5-122B-A10B-VLM-MTP-5bit": {
+        "tier": "abort",
+        "error_classes": [
+            {
+                "type": "metal_cmd_buffer_timeout",
+                "signature": "Metal command-buffer timeout (sparse prefill)",
+                "first_seen_via": "ml-explore/mlx#3457",
+                "hardware": ["M2 Ultra 128GB"],
+                "gpu_family": ["M2"],
+                "workload": "MoE 256x10 prefill ~19K tokens @ 64K context",
+                "mitigation": (
+                    "Reduce context window or split prefill into smaller chunks. "
+                    "metal-guard L7 subprocess isolation contains the abort. "
+                    "Issue closed upstream — no in-MLX fix planned."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-26",
+        "last_observed": "2026-04-26",
+        "panic_signature": "Metal command-buffer timeout (sparse prefill)",
+        "reproductions": [],
+        "community": ["ml-explore/mlx#3457 (M2 Ultra 128GB MoE prefill timeout)"],
+        "recommendation": (
+            "Avoid 64K-context sparse prefill on this MoE quant. Prefer "
+            "shorter contexts or a non-MoE variant for long-form work."
+        ),
+        "upstream": ["https://github.com/ml-explore/mlx/issues/3457"],
+    },
+
+    "mlx-community/Qwen3-Coder-Next-4bit": {
+        "tier": "abort",
+        "error_classes": [
+            {
+                "type": "process_abort",
+                "signature": "cannot schedule new futures after interpreter shutdown",
+                "first_seen_via": "ml-explore/mlx-lm#1208",
+                "hardware": ["unspecified"],
+                "gpu_family": ["M1", "M2", "M3", "M4"],
+                "workload": "mlx_lm.server load_default snapshot_download race",
+                "mitigation": (
+                    "metal-guard v0.11.3 scan_recent_aborts (5min/3-strike) "
+                    "quarantines KeepAlive churn. Pin mlx-lm < 0.31.3 until "
+                    "upstream lands a fix. L11 orphan_monitor catches the "
+                    "SUBPROC_PRE without POST signature."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-27",
+        "last_observed": "2026-04-27",
+        "panic_signature": "cannot schedule new futures after interpreter shutdown",
+        "reproductions": [],
+        "community": [
+            "ml-explore/mlx-lm#1208 (~420 crash-restarts in 2.5h on Coder-Next-4bit)",
+        ],
+        "recommendation": (
+            "Affected by mlx-lm 0.31.3 server lifecycle bug. Pin mlx-lm "
+            "earlier or use scan_recent_aborts to short-circuit KeepAlive "
+            "respawn loops until upstream fix."
+        ),
+        "upstream": ["https://github.com/ml-explore/mlx-lm/issues/1208"],
+    },
+
+    "mlx-community/Qwen3.5-9B-4bit": {
+        "tier": "abort",
+        "error_classes": [
+            {
+                "type": "cmd_buffer_oom",
+                "signature": "kIOGPUCommandBufferCallbackErrorOutOfMemory",
+                "first_seen_via": "ml-explore/mlx-lm#1206",
+                "hardware": ["M5 Max"],
+                "gpu_family": ["M5"],
+                "workload": "LoRA training first backward pass",
+                "mitigation": (
+                    "Does not reproduce on Qwen3-8B-4bit, so this is "
+                    "9B-4bit-specific on applegpu_g17s. metal-guard L7 "
+                    "subprocess isolation contains the abort. No M5 fix "
+                    "until upstream."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-27",
+        "last_observed": "2026-04-27",
+        "panic_signature": "kIOGPUCommandBufferCallbackErrorOutOfMemory",
+        "reproductions": [],
+        "community": ["ml-explore/mlx-lm#1206 (M5 Max LoRA first-backward OOM)"],
+        "recommendation": (
+            "Avoid 9B-4bit LoRA on M5 Max applegpu_g17s. Prefer 8B-4bit "
+            "or pivot to a different quant tier."
+        ),
+        "upstream": ["https://github.com/ml-explore/mlx-lm/issues/1206"],
+    },
+
+    "mlx-community/Qwen3.6-35B-A3B-VLM-MTP-8bit": {
+        "tier": "degradation",
+        "error_classes": [
+            {
+                "type": "silent_corruption",
+                "signature": "VLM checkpoint loaded text-only returns garbage",
+                "first_seen_via": "ml-explore/mlx-lm#1197",
+                "hardware": ["unspecified"],
+                "gpu_family": ["M1", "M2", "M3", "M4", "M5"],
+                "workload": "mlx_lm.load() on a model with vision_config",
+                "mitigation": (
+                    "Detect at load time: if model card has vision_config "
+                    "but loader is mlx-lm (not mlx-vlm), refuse or warn loud. "
+                    "No process abort — output is incoherent but appears "
+                    "successful, so this is a silent class metal-guard "
+                    "currently flags via warn_if_known_panic_model only."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-27",
+        "last_observed": "2026-04-27",
+        "panic_signature": "VLM checkpoint loaded text-only returns garbage",
+        "reproductions": [],
+        "community": ["ml-explore/mlx-lm#1197 (VLM-as-text silent garbage)"],
+        "recommendation": (
+            "Use mlx-vlm to load this checkpoint. Loading via mlx-lm "
+            "succeeds without error but yields incoherent output."
+        ),
+        "upstream": ["https://github.com/ml-explore/mlx-lm/issues/1197"],
+    },
+
+    "mlx-community/kimi-k2.5": {
+        "tier": "abort",
+        "error_classes": [
+            {
+                "type": "kv_cache_oom",
+                "signature": "kIOGPUCommandBufferCallbackErrorOutOfMemory (KV cache)",
+                "first_seen_via": "ml-explore/mlx-lm#1047",
+                "hardware": ["Mac Studio M3 Ultra"],
+                "gpu_family": ["M3"],
+                "workload": "Inference with extended context",
+                "mitigation": (
+                    "Limit context length, lower kv_cache precision, or "
+                    "subprocess-isolate via metal-guard L7. No upstream fix "
+                    "for the model's KV cache memory profile on M3 Ultra."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-12",
+        "last_observed": "2026-04-12",
+        "panic_signature": "kIOGPUCommandBufferCallbackErrorOutOfMemory (KV cache)",
+        "reproductions": [],
+        "community": ["ml-explore/mlx-lm#1047 (Mac Studio M3 Ultra KV cache OOM)"],
+        "recommendation": (
+            "Constrain context length on M3 Ultra; use L7 subprocess "
+            "isolation. No fix available."
+        ),
+        "upstream": ["https://github.com/ml-explore/mlx-lm/issues/1047"],
+    },
 }
+
+# v0.11.4: MLX-version-level blocklist (separate from per-model registry).
+# Some panic/crash classes are caused by the MLX library version itself,
+# regardless of model. Callers should query before spawning workers.
+MLX_VERSION_BLOCKLIST: dict[str, dict[str, Any]] = {
+    "0.31.2": {
+        "severity": "critical",
+        "error_class": "process_abort",
+        "signature": "mx.clear_cache() SIGSEGV (PR #3282 smart-pointer regression)",
+        "reason": (
+            "mx.clear_cache() segfaults when streaming decoders hold state "
+            "across calls. Affects any workload calling clear_cache between "
+            "eval() invocations. Reproduces on M1 Pro and later."
+        ),
+        "first_observed": "2026-04-27",
+        "upstream": ["https://github.com/ml-explore/mlx/issues/3450"],
+        "workaround": "Pin mlx==0.31.1 or wait for 0.31.4+.",
+    },
+}
+
+
+def check_mlx_version_blocked(version: str) -> dict[str, Any] | None:
+    """Return blocklist entry for an MLX library version, else ``None``.
+
+    Caller policy: refuse to spawn workers, downgrade, or warn loud.
+    metal-guard does not refuse on its own — this is advisory only.
+
+    Typical pattern::
+
+        import mlx.core as mx
+        block = metal_guard.check_mlx_version_blocked(mx.__version__)
+        if block is not None:
+            log.error("MLX %s is blocklisted: %s", mx.__version__,
+                      block["workaround"])
+    """
+    return MLX_VERSION_BLOCKLIST.get(version)
+
 
 _WARNED_PANIC_MODELS: set[str] = set()
 

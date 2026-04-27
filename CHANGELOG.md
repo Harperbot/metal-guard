@@ -5,6 +5,47 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.4] — 2026-04-28
+
+Community panic-registry expansion + new MLX-version blocklist mechanism.
+No breaking changes; all v0.11.3 callers continue to work.
+
+### Added
+
+- **`MLX_VERSION_BLOCKLIST`** — new module-level dict for library-version-
+  level (not model-level) panics. First entry: `mlx == 0.31.2` flagged
+  `critical` for the `mx.clear_cache()` SIGSEGV regression introduced by
+  PR #3282 (smart-pointer migration). See
+  [ml-explore/mlx#3450](https://github.com/ml-explore/mlx/issues/3450).
+- **`check_mlx_version_blocked(version: str)`** — advisory query (does
+  not refuse on its own). Pattern:
+  ```python
+  import mlx.core as mx
+  block = metal_guard.check_mlx_version_blocked(mx.__version__)
+  if block:
+      log.error("MLX %s blocklisted: %s", mx.__version__, block["workaround"])
+  ```
+- **5 new `KNOWN_PANIC_MODELS` entries** from the 2026-04-28 ecosystem
+  sweep (covers `mlx#3457`, `mlx-lm#1206 #1208 #1197`, `mlx-lm#1047`):
+  - `mlx-community/Qwen3.5-122B-A10B-VLM-MTP-5bit` — `tier=abort`,
+    Metal cmd-buffer timeout on M2 Ultra 64K-context MoE prefill.
+  - `mlx-community/Qwen3-Coder-Next-4bit` — `tier=abort`, mlx-lm 0.31.3
+    server crash-loop (~420 restarts in 2.5h).
+  - `mlx-community/Qwen3.5-9B-4bit` — `tier=abort`, M5 Max LoRA
+    first-backward `cmd_buffer_oom` (does NOT repro on 8B-4bit).
+  - `mlx-community/Qwen3.6-35B-A3B-VLM-MTP-8bit` — `tier=degradation`,
+    new error class **`silent_corruption`** for VLM checkpoints loaded
+    via mlx-lm (text-only) returning incoherent output without raising.
+  - `mlx-community/kimi-k2.5` — `tier=abort`, Mac Studio M3 Ultra KV
+    cache OOM.
+
+### Tests
+
+- 5 new tests in `tests/test_v011_features.py` covering blocklist schema,
+  blocklist lookup (positive + negative), registry sweep entries
+  presence, and `silent_corruption` error class.
+- Total suite: **338 passed in 5.96s** (was 333).
+
 ## [0.11.3] — 2026-04-28
 
 Proper fix for the `_mock_mlx` test fixture that v0.11.2 worked around by
