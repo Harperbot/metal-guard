@@ -21,7 +21,26 @@ def guard(tmp_path):
 
 @pytest.fixture(autouse=True)
 def _mock_mlx():
-    """Prevent real Metal GPU initialization in tests."""
+    """Prevent real Metal GPU initialization in tests.
+
+    v0.11.2 → fixture rewrite: previously patched only ``sys.modules["mlx.core"]``
+    which broke on CI Python 3.11/3.12/3.13 because ``import mlx.core``
+    first resolves the parent ``mlx`` package — without a parent entry +
+    ``__path__``, the import raises ``ModuleNotFoundError: No module named
+    'mlx'`` before our ``mlx.core`` mock is consulted, taking
+    ``flush_gpu()`` etc. into the ``except ImportError: return`` early-exit
+    and our ``mock.eval`` is never called. Local Python 3.14 happened to
+    succeed via a different code path (more aggressive ``sys.modules``
+    lookup before parent resolution).
+
+    Fix: pre-populate ``sys.modules["mlx"]`` with a stub module that has
+    ``__path__`` so ``import mlx.core`` finds the parent and proceeds to
+    look up the cached child mock. Also clears any pre-existing
+    ``mlx.core`` entry so test-ordering can't leak a stale partial-import.
+    """
+    import sys as _sys
+    import types as _types
+
     mock_mx = MagicMock()
     mock_mx.device_info.return_value = {
         "max_recommended_working_set_size": 48_000_000_000,
@@ -29,8 +48,27 @@ def _mock_mlx():
     mock_mx.get_active_memory.return_value = 0
     mock_mx.get_peak_memory.return_value = 0
     mock_mx.zeros.return_value = mock_mx
-    with patch.dict("sys.modules", {"mlx.core": mock_mx}):
+
+    # Stub parent package: real ModuleType so ``import mlx`` returns it,
+    # ``__path__`` (empty list) so the import system treats it as a
+    # package and proceeds to look for ``mlx.core`` submodule.
+    parent = _types.ModuleType("mlx")
+    parent.__path__ = []  # type: ignore[attr-defined]
+
+    patch_map = {"mlx": parent, "mlx.core": mock_mx}
+    # Snapshot any pre-existing entries so we can restore on teardown.
+    saved = {k: _sys.modules.get(k) for k in patch_map}
+
+    for k, v in patch_map.items():
+        _sys.modules[k] = v
+    try:
         yield mock_mx
+    finally:
+        for k, prev in saved.items():
+            if prev is None:
+                _sys.modules.pop(k, None)
+            else:
+                _sys.modules[k] = prev
 
 
 # ── MemoryStats ──────────────────────────────────────────────────────────

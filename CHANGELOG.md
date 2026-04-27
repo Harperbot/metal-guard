@@ -5,6 +5,35 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.3] — 2026-04-28
+
+Proper fix for the `_mock_mlx` test fixture that v0.11.2 worked around by
+ignoring `tests/test_metal_guard.py`. The whole suite (207 non-fragile +
+126 previously-ignored) now runs on every CI matrix cell.
+
+### Fixed
+
+- **`tests/test_metal_guard.py::_mock_mlx`** — the fixture used to patch
+  only `sys.modules["mlx.core"]`. On CI Python 3.11/3.12/3.13 (and
+  occasionally on 3.14 when test ordering put `test_v011_features.py`
+  first) `import mlx.core` resolves the parent `mlx` package **before**
+  the child, so without a parent `ModuleType` carrying `__path__` the
+  import raises `ModuleNotFoundError: No module named 'mlx'`. That fell
+  through to `flush_gpu()`'s `except ImportError: return`, which meant
+  `mock.eval.assert_called_once()` saw zero calls and 21 tests failed
+  with `Expected 'eval' to have been called once. Called 0 times.`. The
+  rewrite now installs both `mlx` (a stub `ModuleType` with empty
+  `__path__`) and `mlx.core` (the `MagicMock`) into `sys.modules` for
+  the fixture lifetime, then restores prior values on teardown so other
+  tests aren't affected.
+- **`pyproject.toml`** — removed
+  `addopts = "--ignore=tests/test_metal_guard.py"` and the v0.11.2
+  comment block now that the underlying issue is fixed. CI runs all 333
+  tests.
+- **`.github/workflows/ci.yml`** — bumped `actions/checkout@v4 → @v5`
+  and `actions/setup-python@v5 → @v6` to clear the GitHub-Actions Node
+  20 deprecation warning that started appearing on every run.
+
 ## [0.11.2] — 2026-04-28
 
 Hotfix: ignore pre-existing fragile mock tests so CI matrix can produce
