@@ -1,0 +1,156 @@
+name: Known Panic Model Report
+description: Report an MLX model that kernel-panics Apple Silicon — proposes addition to KNOWN_PANIC_MODELS
+title: "[panic] <model-id> on <hardware>"
+labels: ["known-panic-models", "panic-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for contributing to the [Community Panic Registry](https://github.com/Harperbot/metal-guard#-community-panic-registry--known_panic_models)!
+
+        **Before filing**: please confirm the panic happened **with metal-guard's defensive layers engaged** (cross-process lock, cross-model cadence, cleanup helpers). The registry tracks panics that survive metal-guard mitigation — not panics that metal-guard already prevents.
+
+        Also check existing entries in [`KNOWN_PANIC_MODELS`](../blob/main/metal_guard.py) — if your model is already there, please add your data point as a comment on the existing tracking issue rather than filing a new one.
+
+  - type: input
+    id: model_id
+    attributes:
+      label: Model ID
+      description: Full HuggingFace path. Use the exact ID `mlx_lm.load()` / `mlx_vlm.load()` accepts.
+      placeholder: "mlx-community/gemma-4-31b-it-8bit"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Hardware
+      options:
+        - "M1 (base)"
+        - "M1 Pro"
+        - "M1 Max"
+        - "M1 Ultra"
+        - "M2 (base)"
+        - "M2 Pro"
+        - "M2 Max"
+        - "M2 Ultra"
+        - "M3 (base)"
+        - "M3 Pro"
+        - "M3 Max"
+        - "M3 Ultra"
+        - "M4 (base)"
+        - "M4 Pro"
+        - "M4 Max"
+        - "M4 Ultra"
+        - "M5 (base)"
+        - "M5 Pro"
+        - "M5 Max"
+        - "Other (specify in workload field)"
+    validations:
+      required: true
+
+  - type: input
+    id: ram
+    attributes:
+      label: Unified memory (GB)
+      placeholder: "64"
+    validations:
+      required: true
+
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version (build)
+      description: Run `sw_vers` to get the build number.
+      placeholder: "26.4.1 (25E253)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: panic_signature
+    attributes:
+      label: Panic signature
+      description: |
+        Open `/Library/Logs/DiagnosticReports/Retired/panic-full-*.panic` (Full Disk Access required) and paste the `panic(...)` line and the IOGPUMemory.cpp:NNN reference. Redact serial numbers / UUIDs as needed.
+      placeholder: |
+        panic(cpu 4 caller 0xfffffe0032a550f8):
+          "completeMemory() prepare count underflow" @IOGPUMemory.cpp:492
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload pattern
+      description: |
+        What was the model doing when it panicked? Examples:
+        - Single-shot generate (prompt size, max tokens)
+        - Long-running server (uptime, request rate, KV cache size)
+        - Multi-model pipeline (which models cycled, in what order)
+        - Concurrent calls (how many threads / processes)
+      placeholder: |
+        - mlx_lm.server, ~8 min uptime
+        - 1× 23k-token prefill (completed OK), then 3× isolated short-prompt generate
+        - Panic ~30s after 3rd short-prompt generate
+        - Sequential through HTTP, no concurrent client requests
+        - --prompt-cache-bytes 8589934592 set
+    validations:
+      required: true
+
+  - type: input
+    id: time_to_panic
+    attributes:
+      label: Time from worker-ready to panic
+      description: How long after the model finished loading did the panic occur? Use "first call" if it panicked on the first generate.
+      placeholder: "8 min 16 s"
+    validations:
+      required: true
+
+  - type: textarea
+    id: metal_guard_state
+    attributes:
+      label: metal-guard configuration in effect
+      description: Which of the L1–L9 layers were active? Output of `metal_guard.describe_mode()` if available.
+      placeholder: |
+        - L1 thread tracking: yes (3 threads registered)
+        - L7 subprocess isolation: no (in-process)
+        - L8 cross-process lock: yes
+        - L9 CadenceGuard: yes (180s)
+        - L9 CircuitBreaker: yes (24h, panic_count=0 prior)
+        - METALGUARD_MODE=defensive
+    validations:
+      required: true
+
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Verified workaround (if any)
+      description: |
+        What did you switch to that does NOT panic on the same hardware + workload? Concrete data points are most valuable — "switched to Ollama and ran X requests over Y days without panic".
+      placeholder: |
+        Switched to llama.cpp on same hardware, same model family — ran 24 hours under same workload, 0 panics.
+        OR
+        Pivoted to mlx-community/gemma-4-26b-a4b-it-4bit (MoE variant) — same panic-free pattern.
+
+  - type: textarea
+    id: cross_references
+    attributes:
+      label: Cross-references
+      description: |
+        Other places this panic has been reported — GitHub issue threads, lmstudio bugs, forum posts, Discord screenshots. Helps establish reproducibility across users.
+      placeholder: |
+        - ml-explore/mlx#3186 (similar M4 base 32GB report)
+        - lmstudio bug #1740
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: "I confirmed metal-guard's defensive layers were engaged when the panic occurred"
+          required: true
+        - label: "I checked existing `KNOWN_PANIC_MODELS` entries and this model is not already listed"
+          required: true
+        - label: "I'm willing to share the redacted panic-full-*.panic file if maintainers ask for it"
+          required: false

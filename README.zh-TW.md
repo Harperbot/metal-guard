@@ -32,6 +32,41 @@ Apple Silicon 上 [MLX](https://github.com/ml-explore/mlx) 的 GPU 安全層。
 
 相關上游追蹤：`ml-explore/mlx#3186` / `#3346` / `#3348` / `#3350` / `#3384` / `#3390`、`ml-explore/mlx-lm#883` / `#854` / `#897` / `#1015` / `#1047`、`Blaizzy/mlx-vlm#943` / `#967` / `#999` / `#1011` / `#1016`。metal-guard 透過 `check_version_advisories()` 監看這些 issue，若安裝的版本受影響會在啟動時警告。
 
+## 📋 社群 panic 模型登記表 — `KNOWN_PANIC_MODELS`
+
+**user 共筆整理「在 Apple Silicon Mac 上會 kernel panic 的 MLX 模型清單」，含硬體脈絡、根因假說、與經驗證的 workaround。**
+
+Apple IOGPUFamily driver bug 沒有修復時程。雖然 bug 在 upstream，但**哪些模型在哪些 workload 下會踩雷是社群可知的事** —— 只是目前散落在 GitHub issue 串、lmstudio bug 報告、Discord 截圖、跟個人沒上傳的 `panic-full-*.panic` 檔裡。
+
+metal-guard 提供結構化的整理空間：
+
+```python
+from metal_guard import check_known_panic_model, warn_if_known_panic_model
+
+# 載入前檢查
+advisory = check_known_panic_model("mlx-community/gemma-4-31b-it-8bit")
+if advisory is not None:
+    print(advisory["recommendation"])
+
+# 或載入時 fire-and-forget 警告（每 process 每 model_id 只警告一次）
+warn_if_known_panic_model(model_id)
+```
+
+每筆登記項含：
+- **`panic_signature`** — 跟你 `panic-full-*.panic` log 比對的精確 `IOGPUMemory.cpp:NNN` 行號 + 關鍵字
+- **`reproductions`** — production 數據點（硬體 / RAM / panic 距載入時間 / workload）
+- **`community`** — 其他踩同雷的 GitHub issue / lmstudio bug / 論壇 thread 交叉引用
+- **`recommendation`** — 可行 workaround（換 backend / 改 model / cadence 設定）
+- **`upstream`** — 追蹤底層 driver bug 的 GitHub issue 連結
+
+### 怎麼貢獻
+
+如果你在某個 MLX 模型上踩過 kernel panic **且 metal-guard 防線都已啟用**，你的數據點有價值。開一個 [Known Panic Model report](https://github.com/Harperbot/metal-guard/issues/new?template=known-panic-report.yml) — issue template 會引導你填 schema（model ID / 硬體 / panic 簽名 / workload / panic 距載入時間 / 經驗證的 workaround）。Schema 文件見 [CONTRIBUTING.md](CONTRIBUTING.md#known-panic-models-schema)。
+
+登記表設計上保守 — 入庫條件是「production 確實重現」或「upstream issue 有清楚簽名」。我們不希望 false positive 把多數 user 都正常跑的模型黑掉。
+
+**為什麼不直接讀 mlx#3186 留言？** 因為那條 thread 混了硬體報告、假說、嘗試修法、跟無關討論。Registry 把它蒸餾成 code 可 `check_known_panic_model()` 的結構化 advisory — 而且你的 panic 報告不會消失在 50 條留言裡。
+
 ## 問題
 
 Apple Silicon 的 Metal GPU 驅動有一個 bug：GPU 記憶體管理失敗時，**kernel 會 panic 整台機器**，而不是乾淨地殺掉 process。

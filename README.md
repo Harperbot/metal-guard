@@ -32,6 +32,44 @@ If your Mac is panicking / rebooting / crashing while running MLX and you search
 
 Related upstream tracking: `ml-explore/mlx#3186` / `#3346` / `#3348` / `#3350` / `#3384` / `#3390`, `ml-explore/mlx-lm#883` / `#854` / `#897` / `#1015` / `#1047`, `Blaizzy/mlx-vlm#943` / `#967` / `#999` / `#1011` / `#1016`. metal-guard watches these via `check_version_advisories()` and warns at startup if the installed versions are affected.
 
+## 📋 Community Panic Registry — `KNOWN_PANIC_MODELS`
+
+**A user-curated list of MLX models that kernel-panic Apple Silicon Macs in production, with hardware contexts, root-cause hypotheses, and verified workarounds.**
+
+Apple's IOGPUFamily driver bug has no fix timeline. While the bug is upstream, **which models trigger it under which workloads is a community-knowable thing** — but it's currently scattered across GitHub issue threads, lmstudio bug reports, Discord screenshots, and individual `panic-full-*.panic` files nobody publishes.
+
+metal-guard provides a structured home for this knowledge:
+
+```python
+from metal_guard import check_known_panic_model, warn_if_known_panic_model
+
+# Check before loading
+advisory = check_known_panic_model("mlx-community/gemma-4-31b-it-8bit")
+if advisory is not None:
+    print(advisory["recommendation"])
+    # → "metal-guard v0.9.0 narrows the race window... but does NOT eliminate
+    #    panic on this model. Switch backend (Ollama / llama.cpp) or pivot
+    #    to MoE variant (e.g. mlx-community/gemma-4-26b-a4b-it-4bit)."
+
+# Or fire-and-forget warning at load time (per-process dedup)
+warn_if_known_panic_model(model_id)
+```
+
+Each entry carries:
+- **`panic_signature`** — the exact `IOGPUMemory.cpp:NNN` line + keyword to match against your `panic-full-*.panic` log
+- **`reproductions`** — production data points (hardware, RAM, time-to-panic, workload)
+- **`community`** — cross-references to GitHub issues / lmstudio bugs / forum threads where others hit the same panic
+- **`recommendation`** — actionable workaround (backend switch / model pivot / cadence config)
+- **`upstream`** — links to the GitHub issues tracking the underlying driver bug
+
+### How to contribute
+
+If you've hit a kernel panic on a specific MLX model **with metal-guard's defensive layers fully engaged**, your data point is valuable. Open a [Known Panic Model report](https://github.com/Harperbot/metal-guard/issues/new?template=known-panic-report.yml) — the template walks you through the schema (model ID / hardware / panic signature / workload / time-to-panic / verified workaround). Schema docs in [CONTRIBUTING.md](CONTRIBUTING.md#known-panic-models-schema).
+
+The registry is intentionally conservative — entries require either a confirmed production reproduction or a clear upstream issue with reproducible signature. We don't want false positives blacklisting models that work fine for most users.
+
+**Why not just read mlx#3186 comments?** Because that thread mixes hardware reports, hypotheses, attempted fixes, and unrelated discussion. The registry distils it into structured advisory data your code can `check_known_panic_model()` against — and your panic report doesn't disappear into a 50-comment thread.
+
 ## The Problem
 
 Apple's Metal GPU driver on Apple Silicon has a bug: when GPU memory management fails, **the kernel panics the entire machine** instead of gracefully killing the process.
