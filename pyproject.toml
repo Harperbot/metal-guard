@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metal-guard"
-version = "0.10.0"
+version = "0.11.0"
 description = "GPU safety layer for MLX on Apple Silicon — prevents kernel panics from Metal driver bugs, includes community-curated KNOWN_PANIC_MODELS registry"
 readme = "README.md"
 license = "MIT"
@@ -13,10 +13,14 @@ authors = [
     {name = "Harper Systems"},
 ]
 keywords = ["mlx", "apple-silicon", "metal", "gpu", "safety", "kernel-panic"]
+# PEP 639: when `license = "<SPDX>"` is set, the `License :: OSI Approved :: MIT License`
+# classifier MUST be omitted — modern setuptools rejects both at once
+# (`InvalidConfigError: License classifiers have been superseded by license expressions`).
+# v0.10.1 hotfix: removed legacy classifier so `pip install git+https://...` works
+# on modern setuptools/pip (the Option A install path documented in README).
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",

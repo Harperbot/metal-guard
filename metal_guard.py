@@ -80,12 +80,12 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 log = logging.getLogger("metal_guard")
 
@@ -191,6 +191,193 @@ def detect_panic_signature(text: str) -> tuple[str | None, str | None]:
         if pattern.search(text):
             return name, explanation
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Error classifier (v0.11.0)
+#
+# Central regex table covering the MLX-related error signatures observed in
+# the 2026-04 community sweep. Used by:
+#   - SubprocessCrashError to classify stderr → recovery_hint
+#   - L10 panic gate (kernel_panic flavour) and L10b abort scanner (process_abort)
+#   - L11 orphan monitor (uses signature constants for filter)
+#
+# Severity vocabulary:
+#   "kernel_panic"        — IOGPUMemory.cpp underflow / fPendingMemorySet (reboots Mac)
+#   "process_abort"       — generic SIGABRT from MetalStream
+#   "command_buffer_oom"  — kIOGPUCommandBufferCallbackErrorOutOfMemory (mlx-lm#1206)
+#   "gpu_hang"            — kIOGPUCommandBufferCallbackErrorHang (mlx-vlm#1064)
+#   "gpu_page_fault"      — kIOGPUCommandBufferCallbackErrorPageFault
+#   "descriptor_leak"     — Resource limit (NNNNNN) exceeded (mlx-lm#1185)
+#
+# Recovery hints:
+#   "wait_lockout"  — kernel panic → defer 2h+ via panic gate
+#   "respawn_now"   — process abort → restart subprocess immediately
+#   "force_reload"  — descriptor leak → cold-start now (don't wait)
+#
+# INVARIANT: kernel_panic entries MUST appear before process_abort in the
+# table — `classify_mlx_error` is first-match-wins, so when a `.panic` file
+# carries both signatures (command-buffer OOM cascading into kernel panic),
+# the kernel match wins and the abort counter doesn't trip when reboot
+# already happened. Covered by `test_kernel_panic_priority_over_abort`.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ErrorClass:
+    """Classification result for an MLX-emitted error string."""
+    name: str
+    severity: str
+    recovery_hint: str
+    upstream_refs: tuple[str, ...]
+    pattern_str: str
+
+
+_CLASSIFIER_TABLE: tuple[tuple[re.Pattern[str], ErrorClass], ...] = (
+    # ─── Kernel-level panics (reboot machine) — MUST come first ───
+    (
+        re.compile(
+            r"(prepare[_ ]count[_ ]underflow.*(IOGPUMemory\.cpp|completeMemory\(\)))|"
+            r"((IOGPUMemory\.cpp|completeMemory\(\)).*prepare[_ ]count[_ ]underflow)",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        ErrorClass(
+            name="iogpu_prepare_count_underflow",
+            severity="kernel_panic",
+            recovery_hint="wait_lockout",
+            upstream_refs=(
+                "ml-explore/mlx#3186",
+                "ml-explore/mlx#3346",
+                "ml-explore/mlx-lm#883",
+            ),
+            pattern_str=r"prepare_count_underflow + (IOGPUMemory.cpp|completeMemory())",
+        ),
+    ),
+    (
+        re.compile(
+            r"IOGPUGroupMemory\.cpp.*pending.*memory.*set|fPendingMemorySet",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        ErrorClass(
+            name="iogpu_pending_memory_set",
+            severity="kernel_panic",
+            recovery_hint="wait_lockout",
+            upstream_refs=("ml-explore/mlx#3186",),
+            pattern_str=r"IOGPUGroupMemory.cpp pending_memory_set",
+        ),
+    ),
+    # ─── GPU command-buffer errors (process abort, no reboot) ───
+    (
+        re.compile(r"kIOGPUCommandBufferCallbackErrorOutOfMemory", re.IGNORECASE),
+        ErrorClass(
+            name="cmd_buffer_oom",
+            severity="command_buffer_oom",
+            recovery_hint="respawn_now",
+            upstream_refs=("ml-explore/mlx-lm#1206", "ml-explore/mlx-lm#854"),
+            pattern_str=r"kIOGPUCommandBufferCallbackErrorOutOfMemory",
+        ),
+    ),
+    (
+        re.compile(r"kIOGPUCommandBufferCallbackErrorHang", re.IGNORECASE),
+        ErrorClass(
+            name="gpu_hang",
+            severity="gpu_hang",
+            recovery_hint="respawn_now",
+            upstream_refs=("Blaizzy/mlx-vlm#1064",),
+            pattern_str=r"kIOGPUCommandBufferCallbackErrorHang",
+        ),
+    ),
+    (
+        re.compile(
+            r"kIOGPUCommandBufferCallbackErrorPageFault|GPU Address Fault Error",
+            re.IGNORECASE,
+        ),
+        ErrorClass(
+            name="gpu_page_fault",
+            severity="gpu_page_fault",
+            recovery_hint="respawn_now",
+            upstream_refs=("Blaizzy/mlx-vlm#1064",),
+            pattern_str=r"kIOGPUCommandBufferCallbackErrorPageFault",
+        ),
+    ),
+    # ─── Metal descriptor leak (slow degradation) ───
+    (
+        re.compile(
+            r"\[metal::malloc\]\s+Resource limit\s*\(\s*(\d+)\s*\)\s*exceeded|"
+            r"Resource limit \(\d+\) exceeded",
+            re.IGNORECASE,
+        ),
+        ErrorClass(
+            name="metal_descriptor_leak",
+            severity="descriptor_leak",
+            recovery_hint="force_reload",
+            upstream_refs=("ml-explore/mlx-lm#1185",),
+            pattern_str=r"Resource limit (N) exceeded",
+        ),
+    ),
+    # ─── SIGABRT from MetalStream completion handler ───
+    (
+        re.compile(
+            r"std::terminate.*MetalStream::add_temporary|"
+            r"check_error.*Metal.*SIGABRT|"
+            r"libc\+\+abi.*MetalStream",
+            re.IGNORECASE | re.DOTALL,
+        ),
+        ErrorClass(
+            name="metal_completion_sigabrt",
+            severity="process_abort",
+            recovery_hint="respawn_now",
+            upstream_refs=(
+                "ml-explore/mlx#3390", "ml-explore/mlx#3224", "ml-explore/mlx#3317",
+            ),
+            pattern_str=r"MetalStream / check_error std::terminate",
+        ),
+    ),
+    # ─── Generic Metal abort (fallback) ───
+    (
+        re.compile(r"\[METAL\]\s+Command buffer execution failed", re.IGNORECASE),
+        ErrorClass(
+            name="metal_command_buffer_failed",
+            severity="process_abort",
+            recovery_hint="respawn_now",
+            upstream_refs=("Blaizzy/mlx-vlm#1064",),
+            pattern_str=r"[METAL] Command buffer execution failed",
+        ),
+    ),
+)
+
+
+def classify_mlx_error(text: str) -> ErrorClass | None:
+    """Classify a stderr / panic-file body into an :class:`ErrorClass`.
+
+    Returns None if no known pattern matches. Caller should treat None as
+    "unknown abort" — neither kernel panic nor recognized recovery class —
+    and default to conservative respawn. First-match-wins on the priority-
+    ordered :data:`_CLASSIFIER_TABLE`.
+    """
+    if not text:
+        return None
+    for pattern, cls in _CLASSIFIER_TABLE:
+        if pattern.search(text):
+            return cls
+    return None
+
+
+def is_kernel_panic_signature(text: str) -> bool:
+    """True iff text matches a kernel-panic signature (vs process abort)."""
+    cls = classify_mlx_error(text)
+    return cls is not None and cls.severity == "kernel_panic"
+
+
+def is_process_abort_signature(text: str) -> bool:
+    """True iff text matches a non-kernel abort (subprocess died but Mac OK)."""
+    cls = classify_mlx_error(text)
+    if cls is None:
+        return False
+    return cls.severity in (
+        "process_abort", "command_buffer_oom", "gpu_hang",
+        "gpu_page_fault", "descriptor_leak",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1383,6 +1570,67 @@ class MetalGuard:
         if not self._breadcrumb_path:
             return
         line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
+        try:
+            dirname = os.path.dirname(self._breadcrumb_path)
+            if dirname:
+                os.makedirs(dirname, exist_ok=True)
+            with open(self._breadcrumb_path, "a") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+
+    def breadcrumb_with_meta(
+        self,
+        tag: str,
+        payload: str = "",
+        **meta,
+    ) -> None:
+        """v0.11.0 — crash-safe breadcrumb with structured metadata.
+
+        Format::
+
+            [YYYY-MM-DD HH:MM:SS] <TAG>: <payload> | k1=v1 k2=v2 ...
+
+        Backward-compatible with :data:`_BREADCRUMB_LINE_RE` parser (lazy
+        payload + optional meta capture group, v0.11.0). Old `breadcrumb()`
+        callers continue to work; new callers can attach inflight metadata
+        for richer postmortem forensics::
+
+            mg.breadcrumb_with_meta("SUBPROC_PRE", model_id, ctx=2048, kv_bytes=12_000_000)
+            ...
+            mg.breadcrumb_with_meta("SUBPROC_POST", model_id, elapsed_ms=8421, tok_out=512)
+
+        Recommended fields (caller-controlled vocabulary):
+
+            ctx                 prompt token count at SUBPROC_PRE
+            kv_bytes            cumulative KV cache bytes
+            elapsed_ms          generate wall time at SUBPROC_POST
+            tok_out             tokens emitted
+            error_class         classify_mlx_error() name on abort
+            descriptor_used     resource_tracker count at this point
+        """
+        if not self._breadcrumb_path:
+            return
+        # critic R1 P1-3: pipe is the meta separator; replace any `|` in
+        # caller-supplied payload to avoid silent FIFO mis-pairing on the
+        # reader side. Replace with `/` (visually similar, safe in URL/path).
+        if "|" in payload:
+            payload = payload.replace("|", "/")
+        meta_str = ""
+        if meta:
+            # Sort keys for stable parsing; format `k=v` separated by space.
+            # Sanitize values too — pipe in value would also break parser.
+            meta_pairs = sorted(
+                (k, str(v).replace("|", "/")) for k, v in meta.items()
+            )
+            meta_str = " | " + " ".join(f"{k}={v}" for k, v in meta_pairs)
+        prefix = f"{tag}: {payload}" if payload else tag
+        line = (
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+            f"{prefix}{meta_str}\n"
+        )
         try:
             dirname = os.path.dirname(self._breadcrumb_path)
             if dirname:
@@ -2689,24 +2937,64 @@ _DEFAULT_LOAD_TIMEOUT = 120.0
 
 
 class SubprocessCrashError(RuntimeError):
-    """Raised when the MLX worker subprocess crashed (SIGABRT / unexpected exit)."""
+    """Raised when the MLX worker subprocess crashed (SIGABRT / unexpected exit).
+
+    v0.11.0: ``detail`` (typically captured stderr / panic reason) is auto-
+    classified via :func:`classify_mlx_error` on construction. Caller can
+    route retry strategy through ``self.error_class`` and ``self.recovery_hint``::
+
+        try:
+            ...
+        except SubprocessCrashError as exc:
+            if exc.error_class and exc.error_class.severity == "descriptor_leak":
+                # Force cold-restart now (mlx-lm#1185 pattern)
+                runner.shutdown()
+            elif exc.recovery_hint == "wait_lockout":
+                raise  # let panic_gate handle next launchd respawn
+            # else respawn_now / unknown → caller default
+    """
 
     def __init__(self, model_id: str, exitcode: int | None, detail: str = ""):
         self.model_id = model_id
         self.exitcode = exitcode
+        # v0.11.0: classify detail string against known MLX error patterns.
+        # None = unknown abort (e.g. plain SIGKILL with no stderr). Defensive
+        # try/except so classifier failure never blocks exception raise path.
+        self.error_class: ErrorClass | None = None
+        if detail:
+            try:
+                self.error_class = classify_mlx_error(detail)
+            except Exception:  # noqa: BLE001 — never block crash path
+                pass
         sig_name = ""
         if exitcode is not None and exitcode < 0:
             try:
                 sig_name = f" ({signal.Signals(-exitcode).name})"
             except (ValueError, AttributeError):
                 pass
+        cls_tag = ""
+        if self.error_class is not None:
+            cls_tag = f" [{self.error_class.severity}/{self.error_class.name}]"
         msg = (
             f"MLX worker subprocess for {model_id!r} crashed "
-            f"(exit code {exitcode}{sig_name})"
+            f"(exit code {exitcode}{sig_name}{cls_tag})"
         )
         if detail:
             msg += f": {detail}"
         super().__init__(msg)
+
+    @property
+    def recovery_hint(self) -> str:
+        """v0.11.0 — suggested retry strategy for caller routing.
+
+        Vocabulary: ``"wait_lockout"`` (kernel panic, defer 2h+) /
+        ``"respawn_now"`` (process abort, restart immediately) /
+        ``"force_reload"`` (descriptor leak, cold-start now) /
+        ``"unknown"`` (classification failed, caller default).
+        """
+        if self.error_class is None:
+            return "unknown"
+        return self.error_class.recovery_hint
 
 
 class SubprocessTimeoutError(TimeoutError):
@@ -4653,7 +4941,28 @@ def gemma4_generation_flush(model_id: str, generate_call_count: int) -> None:
 # convenience that emits a single ``log.warning`` per process per model_id.
 
 KNOWN_PANIC_MODELS: dict[str, dict[str, Any]] = {
+    # ─── kernel-panic flagship (gemma-4-31b-8bit) ───
     "mlx-community/gemma-4-31b-it-8bit": {
+        # v0.11.0 schema additions: tier + error_classes + verified_safe_alternative
+        "tier": "panic",
+        "error_classes": [
+            {
+                "type": "kernel_panic",
+                "signature": "IOGPUMemory.cpp:492 prepare_count_underflow",
+                "first_seen_via": "Harper production",
+                "hardware": ["M1 Ultra 64GB"],
+                "gpu_family": ["M1", "M3", "M4"],
+                "workload": "OCR consensus debater (sequential model load)",
+                "mitigation": (
+                    "metal-guard v0.9+ narrows race window via cross-model "
+                    "cadence (C5) + gemma4_generation_flush (C7) + "
+                    "subprocess_inference_guard (B1), but DOES NOT eliminate. "
+                    "Switch backend (Ollama / llama.cpp) or pivot to MoE variant."
+                ),
+            },
+        ],
+        "verified_safe_alternative": "mlx-community/gemma-4-26b-a4b-it-4bit",
+        # Legacy fields preserved for backward-compat with v0.9 / v0.10 callers
         "panic_signature": "IOGPUMemory.cpp:492 prepare_count_underflow",
         "first_observed": "2026-04-23",
         "last_observed": "2026-04-24",
@@ -4671,12 +4980,12 @@ KNOWN_PANIC_MODELS: dict[str, dict[str, Any]] = {
             "ml-explore/mlx-lm#883 (M3 Ultra 96GB)",
         ],
         "recommendation": (
-            "metal-guard v0.9.0 narrows the race window via cross-model "
+            "metal-guard v0.9+ narrows the race window via cross-model "
             "cadence (C5) + gemma4_generation_flush (C7) + "
             "subprocess_inference_guard (B1), but does NOT eliminate "
-            "panic on this model in Harper's production workload. If you "
-            "see repeat panics with metal-guard fully engaged, switch "
-            "backend (Ollama / llama.cpp) or pivot to an MoE variant "
+            "panic on this model in production workloads. If you see "
+            "repeat panics with metal-guard fully engaged, switch backend "
+            "(Ollama / llama.cpp) or pivot to MoE variant "
             "(e.g. mlx-community/gemma-4-26b-a4b-it-4bit)."
         ),
         "upstream": [
@@ -4684,6 +4993,156 @@ KNOWN_PANIC_MODELS: dict[str, dict[str, Any]] = {
             "https://github.com/ml-explore/mlx-lm/issues/883",
             "https://github.com/ml-explore/mlx/issues/3346",
         ],
+    },
+
+    # ─── v0.11.0 additions: 2026-04-27 community sweep ───
+    "mlx-community/Qwen3.5-27B-4bit": {
+        "tier": "degradation",
+        "error_classes": [
+            {
+                "type": "metal_descriptor_leak",
+                "signature": "[metal::malloc] Resource limit (499000) exceeded",
+                "first_seen_via": "ml-explore/mlx-lm#1185",
+                "hardware": ["M4 Max 128GB"],
+                "gpu_family": ["M4"],
+                "workload": "LoRA training (mlx_lm.lora)",
+                "mitigation": (
+                    "Lower clear_cache_threshold delays but doesn't eliminate. "
+                    "Use ResourceTracker(cold_restart_after=4000) (L14) to force "
+                    "subprocess respawn before hitting the descriptor limit. "
+                    "Peak memory stable ~60GB so this is descriptor accumulation, "
+                    "not RAM exhaustion."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-26",
+        "last_observed": "2026-04-26",
+        "panic_signature": "[metal::malloc] Resource limit (499000) exceeded",
+        "reproductions": [],
+        "community": ["Ogilthorp3 — ml-explore/mlx-lm#1185 (M4 Max 128GB LoRA)"],
+        "recommendation": (
+            "Inference (non-training) workloads less affected. For LoRA training, "
+            "wire metal_guard.ResourceTracker into your training loop and "
+            "subprocess.shutdown() + spawn new runner before threshold."
+        ),
+        "upstream": ["https://github.com/ml-explore/mlx-lm/issues/1185"],
+    },
+
+    "mlx-community/Qwen3.5-35B-A3B-8bit": {
+        "tier": "degradation",
+        "error_classes": [
+            {
+                "type": "metal_descriptor_leak",
+                "signature": "[metal::malloc] Resource limit (499000) exceeded",
+                "first_seen_via": "ml-explore/mlx-lm#1185",
+                "hardware": ["M4 Max 128GB"],
+                "gpu_family": ["M4"],
+                "workload": "LoRA training (qwen3_5 architecture)",
+                "mitigation": "Same as Qwen3.5-27B-4bit; pre-emptive cold restart.",
+            },
+            {
+                "type": "process_abort",
+                "signature": "GeneratorExit / prefill interrupted",
+                "first_seen_via": "jundot/omlx#578",
+                "hardware": ["M4 Max 64GB"],
+                "gpu_family": ["M4"],
+                "workload": (
+                    "Long-context agent streaming (Claude Code) even with "
+                    "SpecPrefill OFF + TurboQuant OFF"
+                ),
+                "mitigation": (
+                    "metal-guard L11 orphan_monitor will detect SUBPROC_PRE "
+                    "without matching POST after 90s — caller can SIGKILL "
+                    "worker. No upstream fix yet."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-22",
+        "last_observed": "2026-04-26",
+        "panic_signature": "[metal::malloc] Resource limit (499000) exceeded",
+        "reproductions": [],
+        "community": [
+            "Ogilthorp3 — ml-explore/mlx-lm#1185 (M4 Max 128GB LoRA)",
+            "fparrav — jundot/omlx#578 (M4 Max 64GB long-context streaming)",
+        ],
+        "recommendation": (
+            "MoE 35B variant has two distinct failure modes: descriptor leak "
+            "during training (#1185) AND streaming prefill interruption "
+            "(omlx#578). Avoid for production LoRA. For inference, use L7 "
+            "subprocess isolation + L11 orphan monitor."
+        ),
+        "upstream": [
+            "https://github.com/ml-explore/mlx-lm/issues/1185",
+            "https://github.com/jundot/omlx/issues/578",
+        ],
+    },
+
+    "mlx-community/Qwen3.6-35B-A3B-8bit": {
+        "tier": "abort",
+        "error_classes": [
+            {
+                "type": "process_abort",
+                "signature": "DFlash drafter abort + client drop",
+                "first_seen_via": "jundot/omlx#902",
+                "hardware": ["M4 Max"],
+                "gpu_family": ["M4"],
+                "workload": "DFlash speculative decoding enabled",
+                "mitigation": (
+                    "Disable DFlash for this model. Plain decoding works; "
+                    "DFlash drafter has unresolved kernel issue specific to "
+                    "MoE A3B 8-bit quant."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-22",
+        "last_observed": "2026-04-22",
+        "panic_signature": "DFlash drafter abort + client drop",
+        "reproductions": [],
+        "community": ["jundot/omlx#902 (DFlash drafter abort)"],
+        "recommendation": "Run with DFlash disabled, or pivot to non-A3B variant.",
+        "upstream": ["https://github.com/jundot/omlx/issues/902"],
+    },
+
+    "mlx-community/Qwen3-VL-2B-Instruct": {
+        "tier": "abort",
+        "error_classes": [
+            {
+                "type": "gpu_hang",
+                "signature": "kIOGPUCommandBufferCallbackErrorHang",
+                "first_seen_via": "Blaizzy/mlx-vlm#1064",
+                "hardware": ["M5 Max"],
+                "gpu_family": ["M5"],
+                "workload": "VLM prefill + generate (mlx-vlm 0.4.5 + mlx 0.32.0.dev)",
+                "mitigation": (
+                    "M5 Max applegpu_g17s specific. metal-guard L7 subprocess "
+                    "isolation contains the abort. No known mitigation on M5 "
+                    "hardware until upstream fix."
+                ),
+            },
+            {
+                "type": "gpu_page_fault",
+                "signature": "kIOGPUCommandBufferCallbackErrorPageFault",
+                "first_seen_via": "Blaizzy/mlx-vlm#1064 (Qwen3-VL-2B-Thinking-bf16)",
+                "hardware": ["M5 Max"],
+                "gpu_family": ["M5"],
+                "workload": "VLM prefill on Thinking-bf16 variant",
+                "mitigation": "Same as above — M5 Max specific.",
+            },
+        ],
+        "verified_safe_alternative": "mlx-community/gemma-4-26b-a4b-it-4bit",
+        "first_observed": "2026-04-24",
+        "last_observed": "2026-04-24",
+        "panic_signature": "kIOGPUCommandBufferCallbackErrorHang",
+        "reproductions": [],
+        "community": ["jrp2014 — Blaizzy/mlx-vlm#1064 (M5 Max VLM)"],
+        "recommendation": (
+            "Avoid Qwen3-VL family on M5 Max applegpu_g17s. M1-M4 untested "
+            "but no reports yet."
+        ),
+        "upstream": ["https://github.com/Blaizzy/mlx-vlm/issues/1064"],
     },
 }
 
@@ -4726,6 +5185,71 @@ def warn_if_known_panic_model(model_id: str) -> bool:
     return True
 
 
+# v0.11.0 helpers — filter / index by the new schema dimensions
+
+def check_known_panic_model_for_gpu(
+    model_id: str,
+    *,
+    gpu_family: str | None = None,
+) -> dict[str, Any] | None:
+    """Return advisory for ``model_id``, optionally filtered by GPU family.
+
+    When ``gpu_family`` (e.g. ``"M1"``, ``"M5"``) is provided, ``error_classes``
+    not confirmed on that family are filtered out — caller sees only what
+    actually affects their hardware. Returns None if the filtered list is
+    empty (model affected on other families but not yours).
+
+    Falls back to :func:`check_known_panic_model` when ``gpu_family`` is
+    None (legacy unfiltered behaviour).
+    """
+    if gpu_family is None:
+        return check_known_panic_model(model_id)
+    advisory = KNOWN_PANIC_MODELS.get(model_id)
+    if advisory is None:
+        return None
+    error_classes = advisory.get("error_classes")
+    if not error_classes:
+        # Entry without v0.11.0 schema — return as-is (no per-family filter)
+        return advisory
+    filtered = [
+        ec for ec in error_classes
+        if not ec.get("gpu_family") or gpu_family in ec["gpu_family"]
+    ]
+    if not filtered:
+        return None
+    return {**advisory, "error_classes": filtered}
+
+
+def models_by_tier(tier: str) -> tuple[str, ...]:
+    """All KNOWN_PANIC_MODELS IDs at a given tier.
+
+    Tier vocabulary: ``"panic"`` (kernel-level, reboots Mac) /
+    ``"abort"`` (process-level SIGABRT or hang) /
+    ``"degradation"`` (slow descriptor leak, no abort).
+
+    Entries without ``tier`` (legacy schema) are excluded.
+    """
+    return tuple(sorted(
+        m for m, advise in KNOWN_PANIC_MODELS.items()
+        if advise.get("tier") == tier
+    ))
+
+
+def models_affecting_gpu_family(gpu_family: str) -> tuple[str, ...]:
+    """All model IDs with at least one error_class confirmed on ``gpu_family``.
+
+    Entries without ``error_classes`` (legacy schema) are excluded — call
+    :func:`check_known_panic_model` directly to access them.
+    """
+    out: list[str] = []
+    for m, advise in KNOWN_PANIC_MODELS.items():
+        for ec in advise.get("error_classes", []):
+            if gpu_family in ec.get("gpu_family", []):
+                out.append(m)
+                break
+    return tuple(sorted(out))
+
+
 # ===========================================================================
 # v0.10.0 — L10/L11/L12/L13 Harper-private features promoted to public
 # (2026-04-27)
@@ -4750,6 +5274,26 @@ def warn_if_known_panic_model(model_id: str) -> bool:
 PANIC_REPORTS_GLOBS: tuple[str, ...] = (
     "/Library/Logs/DiagnosticReports/Retired/panic-full-*.panic",
     "/Library/Logs/DiagnosticReports/panic-full-*.panic",
+)
+
+# v0.11.0 (critic R1 P0-1): macOS writes process-level aborts (SIGABRT,
+# `.ips` reports for app crashes) to a different path than kernel panics.
+# `panic-full-*.panic` files only cover kernel-level reboots; the
+# `command_buffer_oom` / `gpu_hang` / `gpu_page_fault` / `descriptor_leak`
+# class strings appear in:
+#   - subprocess stderr (caught by `SubprocessCrashError(detail=...)`)
+#   - `*.ips` reports (system + user DiagnosticReports), JSON-ish format
+#     containing the crash trace
+#   - cascade-into-panic dumps when an abort triggers kernel-level fault
+#
+# `scan_recent_aborts` reads both globs so dashboard surface reflects
+# reality. Tests wrote synthetic abort strings into `.panic` files; that
+# still works (cascade case) AND now `.ips` reports also contribute.
+_ABORT_REPORTS_GLOBS: tuple[str, ...] = (
+    "/Library/Logs/DiagnosticReports/*.ips",
+    os.path.expanduser("~/Library/Logs/DiagnosticReports/*.ips"),
+    # Cascade case: abort signature appearing inside a kernel panic dump
+    *PANIC_REPORTS_GLOBS,
 )
 
 _PANIC_SENTINEL_PATH = os.path.expanduser("~/.cache/metal-guard/panic-sentinel.json")
@@ -4791,12 +5335,20 @@ class CooldownVerdict:
         0 → proceed (no panic / cooldown expired / kill-switch)
         2 → skip this run (cooldown active or lockout)
         ≥3 → gate broken; wrappers should treat as fail-open
+
+    v0.11.0: ``abort_count_24h`` exposes process-aborts (non-rebooting
+    failures: command_buffer_oom / gpu_hang / gpu_page_fault /
+    descriptor_leak) for dashboard surface. Aborts DO NOT influence
+    ``exit_code`` — the 24h/72h staircase lockout is reserved for kernel
+    panics that actually rebooted the machine. Abort frequency is exposed
+    for ops visibility but does not gate plist wrapper retry decisions.
     """
     exit_code: int
     reason: str
     recent_panics_24h: int
     recent_panics_72h: int
     cooldown_until: datetime.datetime | None
+    abort_count_24h: int = 0  # v0.11.0 informational only
 
 
 def _gate_env_float(name: str, default: float) -> float:
@@ -4976,16 +5528,29 @@ def evaluate_panic_cooldown(
     count_24h = len(panics_24h)
     count_72h = len(panics_72h)
 
+    # v0.11.0: surface abort_count_24h on every verdict for dashboard.
+    # Defensive try/except so abort scan failure never blocks the panic
+    # gate decision — gate safety > telemetry richness.
+    abort_count_24h = 0
+    try:
+        abort_count_24h = len(scan_recent_aborts(24.0, now=now))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("scan_recent_aborts failed: %s", exc)
+
     hours = _staircase_cooldown_hours(count_24h, count_72h)
 
     if hours is None:
-        return CooldownVerdict(0, "no recent IOGPU panics", count_24h, count_72h, None)
+        return CooldownVerdict(
+            0, "no recent IOGPU panics", count_24h, count_72h, None,
+            abort_count_24h=abort_count_24h,
+        )
 
     if hours < 0:
         latest = panics_72h[0].timestamp if panics_72h else None
         if _read_lockout_ack_valid(now, latest_panic=latest):
             return CooldownVerdict(
                 0, "lockout cleared by ack", count_24h, count_72h, None,
+                abort_count_24h=abort_count_24h,
             )
         # critic R1 P1-3 guard: if user sets METALGUARD_PANIC_LOCKOUT_72H_N=0
         # the gate enters lockout-on-empty-list path. Default to "no auto-clear"
@@ -4994,12 +5559,14 @@ def evaluate_panic_cooldown(
         if _lockout_absolute_max_reached(earliest, now):
             return CooldownVerdict(
                 0, "lockout absolute-max elapsed", count_24h, count_72h, None,
+                abort_count_24h=abort_count_24h,
             )
         return CooldownVerdict(
             2,
             f"lockout: 24h={count_24h} 72h={count_72h}; "
             f"touch {_PANIC_LOCKOUT_ACK_PATH} to clear",
             count_24h, count_72h, None,
+            abort_count_24h=abort_count_24h,
         )
 
     latest = panics_72h[0].timestamp
@@ -5009,11 +5576,13 @@ def evaluate_panic_cooldown(
             2,
             f"cooldown {hours:.1f}h until {cooldown_until.isoformat(timespec='seconds')}",
             count_24h, count_72h, cooldown_until,
+            abort_count_24h=abort_count_24h,
         )
     return CooldownVerdict(
         0,
         f"cooldown expired (latest panic {latest.isoformat(timespec='seconds')})",
         count_24h, count_72h, None,
+        abort_count_24h=abort_count_24h,
     )
 
 
@@ -5086,11 +5655,19 @@ def clear_panic_sentinel() -> bool:
 # L11 — Subprocess orphan monitor (C6 in Harper fork)
 # ---------------------------------------------------------------------------
 
-# Breadcrumb line format:
+# Breadcrumb line format (v0.11.0 — supports optional `| k=v` metadata):
 #   [2026-04-23 17:39:43] SUBPROC_PRE: mlx-community/gemma-4-26b-a4b-8bit
+#   [2026-04-28 ...]      SUBPROC_PRE: model-x | ctx=2048 kv_bytes=12000000
+#
+# `payload` lazy-stops at the optional ` | <meta>` separator. Without
+# lazy stop, FIFO pairing in `scan_orphan_subproc_pre` keys by the full
+# string so PRE/POST with different meta never match → false-positive
+# orphan storm. See `breadcrumb_with_meta()` companion writer.
 _BREADCRUMB_LINE_RE = re.compile(
     r"^\[(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\] "
-    r"(?P<tag>[A-Z_0-9]+): (?P<payload>.*)$"
+    r"(?P<tag>[A-Z_0-9]+): "
+    r"(?P<payload>[^|]*?)"
+    r"(?:\s*\|\s*(?P<meta>.*))?$"
 )
 _WORKER_READY_RE = re.compile(
     r"SUBPROCESS_WORKER: (?P<model>\S+) ready, pid=(?P<pid>\d+)"
@@ -5646,3 +6223,288 @@ def write_status_snapshot(
             pass
         raise
     return out_path
+
+
+# ===========================================================================
+# v0.11.0 — Continued promotion from Harper-private fork (2026-04-28)
+#
+# Builds on v0.10's L10-L13 with ports informed by the 2026-04-27 community
+# sweep (mlx-lm#1185/1206 + mlx-vlm#1064 + omlx#578/862/902):
+#
+#   - L10b — Subprocess process-abort scanner (separate from kernel panic)
+#   - L13b — Apple GPU family detection + resource_limit telemetry
+#   - L14  — Resource-leak heuristic (descriptor count cold-restart)
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# L10b — Process-abort scanner (separate counter from kernel panics)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AbortRecord:
+    """A non-kernel-panic abort observed in DiagnosticReports / panic logs.
+
+    ``error_class`` is the :class:`ErrorClass` ``name`` string.
+    """
+    path: pathlib.Path
+    timestamp: datetime.datetime
+    error_class: str
+
+
+def _file_matches_process_abort(path: str) -> tuple[bool, str | None]:
+    """Read panic file + classify as process-level abort (not kernel panic).
+
+    Kernel-panic signatures take priority — if the file matches both kernel
+    + abort patterns, classify as kernel_panic and return False here. The
+    abort counter must not double-count machines that already rebooted.
+    """
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as exc:
+        log.debug("metal-guard abort scan: cannot read %s: %s", path, exc)
+        return False, None
+    cls = classify_mlx_error(content)
+    if cls is None or cls.severity == "kernel_panic":
+        return False, None
+    return True, cls.name
+
+
+def _iter_abort_files() -> list[str]:
+    """Enumerate abort report files: ``.ips`` (user + system) + cascade panics.
+
+    See `_ABORT_REPORTS_GLOBS` for rationale (critic R1 P0-1).
+    """
+    out: list[str] = []
+    for pattern in _ABORT_REPORTS_GLOBS:
+        out.extend(glob.glob(pattern))
+    return out
+
+
+def scan_recent_aborts(
+    hours: float = 24.0,
+    *,
+    now: datetime.datetime | None = None,
+) -> list[AbortRecord]:
+    """Return process-abort records (NOT kernel panics) within ``hours``.
+
+    Default 24h window (vs panics' 72h) because aborts respawn fast and
+    cumulative exposure decays quicker; longer history is noise.
+
+    v0.11.0 (critic R1 P0-1): now reads `.ips` files (where macOS writes
+    process abort traces) IN ADDITION TO `panic-full-*.panic` (where
+    abort signatures sometimes appear when an abort cascades into a
+    kernel panic). Caller should still treat 0 results as "either nothing
+    aborted, or the abort happened on a path metal-guard doesn't observe"
+    (e.g. subprocess died with no stderr captured + no `.ips` written).
+    """
+    now = now or datetime.datetime.now()
+    cutoff = now - datetime.timedelta(hours=hours)
+    records: list[AbortRecord] = []
+    seen_paths: set[str] = set()
+    for p in _iter_abort_files():
+        if p in seen_paths:
+            continue
+        seen_paths.add(p)
+        try:
+            mtime_ts = os.path.getmtime(p)
+        except OSError:
+            continue
+        mtime = datetime.datetime.fromtimestamp(mtime_ts)
+        if mtime < cutoff:
+            continue
+        matched, error_class = _file_matches_process_abort(p)
+        if not matched or error_class is None:
+            continue
+        records.append(AbortRecord(pathlib.Path(p), mtime, error_class))
+    records.sort(key=lambda r: r.timestamp, reverse=True)
+    return records
+
+
+# ---------------------------------------------------------------------------
+# L13b — Apple GPU family detection + resource_limit telemetry
+# ---------------------------------------------------------------------------
+
+
+_APPLE_GPU_FAMILY_MAP = {
+    "applegpu_g13": "M1",       # M1 base / Pro / Max / Ultra (g13/g13c/g13d/g13s)
+    "applegpu_g14": "M2",       # M2 base / Pro / Max / Ultra
+    "applegpu_g15": "M3",       # M3 base / Pro / Max / Ultra
+    "applegpu_g16": "M4",       # M4 base / Pro / Max
+    "applegpu_g17": "M5",       # M5 base / Pro / Max (g17/g17s, mlx-lm#1206)
+}
+
+
+def _classify_gpu_family(architecture: str) -> str:
+    """Map architecture string (e.g. ``applegpu_g13d``) → family (``M1``).
+
+    Returns the architecture string itself when no prefix matches — caller
+    should treat as ``"unknown"``-class without raising. Empty/None → "unknown".
+    """
+    arch = (architecture or "").strip().lower()
+    if not arch:
+        return "unknown"
+    for prefix, family in _APPLE_GPU_FAMILY_MAP.items():
+        if arch.startswith(prefix):
+            return family
+    return arch
+
+
+def apple_gpu_family() -> dict[str, Any]:
+    """Return Apple GPU family info from ``mlx.core.device_info()``.
+
+    Falls back to graceful no-op dict when MLX isn't importable. Never
+    raises into caller — diagnostic only.
+
+    Schema::
+
+        {
+          "available": bool,
+          "device_name": str | None,           # e.g. "Apple M1 Ultra"
+          "architecture": str | None,          # e.g. "applegpu_g13d"
+          "family": str,                       # "M1" / ... / "M5" / "unknown"
+          "resource_limit_descriptors": int | None,  # mlx-lm#1185 limit
+          "max_buffer_length_gb": float | None,
+          "max_recommended_working_set_gb": float | None,
+          "memory_size_gb": float | None,
+          "error": str | None,                 # only on failure
+        }
+    """
+    out: dict[str, Any] = {
+        "available": False,
+        "device_name": None,
+        "architecture": None,
+        "family": "unknown",
+        "resource_limit_descriptors": None,
+        "max_buffer_length_gb": None,
+        "max_recommended_working_set_gb": None,
+        "memory_size_gb": None,
+    }
+    try:
+        import mlx.core as mx  # type: ignore[import-not-found]
+    except ImportError as exc:
+        out["error"] = f"mlx.core import failed: {exc}"
+        return out
+    except Exception as exc:  # noqa: BLE001 — cooldown env may be wedged
+        out["error"] = f"mlx.core import error: {type(exc).__name__}: {exc}"
+        return out
+
+    try:
+        info = mx.device_info()
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"mx.device_info failed: {type(exc).__name__}: {exc}"
+        return out
+
+    out["available"] = True
+    out["device_name"] = info.get("device_name")
+    out["architecture"] = info.get("architecture")
+    out["family"] = _classify_gpu_family(info.get("architecture", ""))
+    out["resource_limit_descriptors"] = info.get("resource_limit")
+    if "max_buffer_length" in info:
+        out["max_buffer_length_gb"] = round(info["max_buffer_length"] / 1e9, 2)
+    if "max_recommended_working_set_size" in info:
+        out["max_recommended_working_set_gb"] = round(
+            info["max_recommended_working_set_size"] / 1e9, 2,
+        )
+    if "memory_size" in info:
+        out["memory_size_gb"] = round(info["memory_size"] / 1e9, 2)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# L14 — Resource-leak heuristic (Metal descriptor count cold-restart)
+# ---------------------------------------------------------------------------
+
+
+_RESOURCE_TRACKER_DEFAULT_THRESHOLD = 4000
+_RESOURCE_TRACKER_KILL_SWITCH_ENV = "METALGUARD_COLD_RESTART_DISABLED"
+_RESOURCE_TRACKER_THRESHOLD_ENV = "METALGUARD_COLD_RESTART_AFTER_N"
+
+
+@dataclass
+class ResourceTracker:
+    """Per-runner inference counter with cold-restart heuristic.
+
+    Thread-safe. Counter resets on :meth:`reset` after a cold restart cycle.
+    Defaults are conservative — based on community evidence in mlx-lm#1185
+    that crashes happened "partway through LoRA training" with peak memory
+    stable, suggesting descriptor exhaustion rather than RAM exhaustion.
+    """
+
+    cold_restart_after: int = _RESOURCE_TRACKER_DEFAULT_THRESHOLD
+    _count: int = field(default=0, init=False)
+    _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _last_restart_at_count: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        env_raw = os.environ.get(_RESOURCE_TRACKER_THRESHOLD_ENV, "").strip()
+        if env_raw:
+            try:
+                env_val = int(env_raw)
+                if env_val > 0:
+                    object.__setattr__(self, "cold_restart_after", env_val)
+            except ValueError:
+                log.warning(
+                    "metal-guard ResourceTracker: invalid %s=%r, using %d",
+                    _RESOURCE_TRACKER_THRESHOLD_ENV, env_raw,
+                    self.cold_restart_after,
+                )
+
+    def record_inference(self) -> int:
+        """Increment counter; return new total."""
+        with self._lock:
+            self._count += 1
+            return self._count
+
+    def should_cold_restart(self) -> bool:
+        """True iff cumulative inferences hit threshold.
+
+        ``METALGUARD_COLD_RESTART_DISABLED=1`` short-circuits to False.
+        """
+        if os.environ.get(_RESOURCE_TRACKER_KILL_SWITCH_ENV) == "1":
+            return False
+        with self._lock:
+            return self._count >= self.cold_restart_after
+
+    def reset(self) -> int:
+        """Zero the counter after a cold-restart cycle. Returns prior count."""
+        with self._lock:
+            prior = self._count
+            self._last_restart_at_count = prior
+            self._count = 0
+            return prior
+
+    def snapshot(self) -> dict[str, Any]:
+        """Read-only state for status / dashboard."""
+        with self._lock:
+            return {
+                "current_count": self._count,
+                "threshold": self.cold_restart_after,
+                "fraction_used": (
+                    self._count / self.cold_restart_after
+                    if self.cold_restart_after > 0 else 0.0
+                ),
+                "last_restart_at_count": self._last_restart_at_count,
+                "kill_switch_active": (
+                    os.environ.get(_RESOURCE_TRACKER_KILL_SWITCH_ENV) == "1"
+                ),
+            }
+
+
+_GLOBAL_RESOURCE_TRACKER: ResourceTracker | None = None
+
+
+def global_resource_tracker() -> ResourceTracker:
+    """Lazy-initialised singleton :class:`ResourceTracker`."""
+    global _GLOBAL_RESOURCE_TRACKER
+    if _GLOBAL_RESOURCE_TRACKER is None:
+        _GLOBAL_RESOURCE_TRACKER = ResourceTracker()
+    return _GLOBAL_RESOURCE_TRACKER
+
+
+def _reset_global_resource_tracker() -> None:
+    """Test helper — production callers should not need this."""
+    global _GLOBAL_RESOURCE_TRACKER
+    _GLOBAL_RESOURCE_TRACKER = None

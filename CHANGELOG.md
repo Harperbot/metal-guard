@@ -5,6 +5,150 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.0] — 2026-04-28
+
+Release combining the v0.10.1 install hotfix with second-wave Harper-
+private feature ports informed by the 2026-04-27 community sweep
+(mlx-lm#1185, mlx-lm#1206, mlx-vlm#1064, omlx#578/#862/#902).
+
+### Fixed (was v0.10.1 hotfix)
+
+- **PEP 639 conflict in `pyproject.toml`** preventing editable install
+  on modern setuptools (`License classifiers have been superseded by
+  license expressions`). v0.10.0 declared both
+  `license = "MIT"` (SPDX expression) AND
+  `License :: OSI Approved :: MIT License` (classifier) — modern
+  setuptools (≥80) rejected the conflict with `InvalidConfigError`,
+  blocking every `pip install -e .` and `pip install
+  git+https://github.com/Harperbot/metal-guard.git@v0.10.0`. **Every
+  CI run since v0.9.0 (2026-04-24) failed for this reason**, and the
+  README Option A install path documented in v0.10.0 was actually
+  broken on modern Python toolchains. SPDX expression is now the
+  single source of truth.
+
+- **L11 orphan-monitor regex over-greedy** — `_BREADCRUMB_LINE_RE`
+  used `(?P<payload>.*)$` which swallowed any trailing
+  ` | k=v ...` metadata into the payload group. FIFO pairing in
+  `scan_orphan_subproc_pre` keys by the full string, so PRE/POST
+  written via `breadcrumb_with_meta()` (new in v0.11.0) with different
+  meta would never match → false-positive orphan storm. Regex now
+  lazy-stops at the optional ` | <meta>` separator.
+
+### Added — `error_classifier` (informed by 2026-04 community sweep)
+
+Central regex table (`classify_mlx_error(text) -> ErrorClass | None`)
+covering 7 distinct MLX-related error signatures across 6 severity
+classes:
+
+| Severity | Recovery hint | Source signal |
+|---|---|---|
+| `kernel_panic` | `wait_lockout` | `prepare_count_underflow` + `IOGPUMemory.cpp` |
+| `kernel_panic` | `wait_lockout` | `IOGPUGroupMemory.cpp:219` `fPendingMemorySet` |
+| `command_buffer_oom` | `respawn_now` | `kIOGPUCommandBufferCallbackErrorOutOfMemory` (mlx-lm#1206) |
+| `gpu_hang` | `respawn_now` | `kIOGPUCommandBufferCallbackErrorHang` (mlx-vlm#1064) |
+| `gpu_page_fault` | `respawn_now` | `kIOGPUCommandBufferCallbackErrorPageFault` |
+| `descriptor_leak` | `force_reload` | `[metal::malloc] Resource limit (N) exceeded` (mlx-lm#1185) |
+| `process_abort` | `respawn_now` | MetalStream SIGABRT, generic command buffer failure |
+
+INVARIANT: kernel-panic entries are first in the priority table; when
+both kernel + abort signatures appear in one log, kernel wins so the
+abort counter doesn't double-count machines that already rebooted.
+
+`SubprocessCrashError` now auto-classifies `detail` on construction
+and exposes `error_class` + `recovery_hint` for caller routing.
+
+### Added — L10b: process-abort scanner
+
+- `scan_recent_aborts(hours=24.0)` — sibling to `scan_recent_panics`
+  but for non-rebooting failures (default 24h vs 72h window since
+  aborts decay quicker).
+- `AbortRecord` dataclass with `error_class` field.
+- `CooldownVerdict.abort_count_24h` — informational only, exposed for
+  dashboard surface but **does NOT** influence `exit_code`. The
+  staircase lockout remains reserved for kernel panics that actually
+  rebooted the machine.
+
+### Added — L13b: Apple GPU family detection
+
+- `apple_gpu_family() -> dict` reads `mx.device_info()`:
+  `architecture`, `resource_limit`, `max_buffer_length`,
+  `max_recommended_working_set_size`, `memory_size`. Maps to family
+  `M1` / `M2` / `M3` / `M4` / `M5` via `applegpu_g13` / `g14` / `g15`
+  / `g16` / `g17` prefix. mlx-lm#1206 hypothesises that
+  `applegpu_g17s` (M5 Max) has command-buffer limits independent of
+  RAM, so per-family classification feeds `KNOWN_PANIC_MODELS`
+  filtering.
+
+### Added — L14: descriptor-leak heuristic
+
+- `ResourceTracker(cold_restart_after=4000)` — thread-safe inference
+  counter targeting mlx-lm#1185 descriptor leak (Resource limit
+  exceeded). Caller calls `record_inference()` after each generate;
+  `should_cold_restart()` returns True at threshold so caller can
+  shutdown + spawn new subprocess to release accumulated descriptors.
+  `mx.clear_cache()` releases buffers but descriptor handles
+  accumulate independently — only subprocess respawn fully releases.
+- Env knobs: `METALGUARD_COLD_RESTART_AFTER_N`,
+  `METALGUARD_COLD_RESTART_DISABLED=1` (kill switch).
+
+### Added — `breadcrumb_with_meta()`
+
+- `metal_guard.breadcrumb_with_meta(tag, payload, **meta)` — structured
+  breadcrumb format `[ts] TAG: payload | k1=v1 k2=v2`. Lets caller
+  attach `ctx`, `kv_bytes`, `elapsed_ms`, `tok_out`, `error_class`,
+  `descriptor_used` for richer postmortem forensics.
+- L11 `_BREADCRUMB_LINE_RE` updated to lazy regex with optional `meta`
+  capture group — backward-compatible with legacy `breadcrumb()`
+  callers.
+
+### Changed — `KNOWN_PANIC_MODELS` schema
+
+Schema upgrade adds three optional fields to each entry (legacy fields
+preserved for backward-compat with v0.9 / v0.10 callers):
+
+- `tier`: `"panic"` (kernel-level, reboots Mac) /
+  `"abort"` (process-level SIGABRT or hang) /
+  `"degradation"` (slow descriptor leak, no abort).
+- `error_classes[]`: list of distinct failure modes per model. Each
+  entry has `type` / `signature` / `first_seen_via` / `hardware` /
+  `gpu_family` / `workload` / `mitigation`. Multiple modes per model
+  (e.g. mlx-vlm#1064 has both `Hang` and `PageFault` variants).
+- `verified_safe_alternative`: known-safe pivot model_id.
+
+New helper functions:
+
+- `check_known_panic_model_for_gpu(model_id, gpu_family="M5")` —
+  filters `error_classes` by GPU family. Returns None when the model
+  is in registry but no error_classes apply to your hardware.
+- `models_by_tier(tier)` — query by severity tier.
+- `models_affecting_gpu_family(family)` — list models confirmed on
+  family.
+
+### Added — 4 new `KNOWN_PANIC_MODELS` entries
+
+- `mlx-community/Qwen3.5-27B-4bit` — degradation (LoRA descriptor leak,
+  M4 Max, mlx-lm#1185).
+- `mlx-community/Qwen3.5-35B-A3B-8bit` — degradation + abort (LoRA
+  leak #1185 + long-context streaming abort omlx#578).
+- `mlx-community/Qwen3.6-35B-A3B-8bit` — abort (DFlash drafter,
+  omlx#902). Mitigation: disable DFlash.
+- `mlx-community/Qwen3-VL-2B-Instruct` — abort (M5 Max GPU hang +
+  page fault, mlx-vlm#1064). Mitigation: avoid M5 Max; M1-M4 untested.
+
+The original `gemma-4-31b-it-8bit` entry retains its legacy fields and
+adds the new schema fields.
+
+### Notes
+
+The earliest test of the registry's value: **v0.11.0 ships data on
+five distinct (model × hardware × workload) combinations, not just
+one**. If a user on M5 Max hits Qwen3-VL hang, they can now query
+metal-guard before debugging upstream. If a user on M4 Max starts a
+LoRA on Qwen3.5-27B, they can wire `ResourceTracker` from day one
+instead of waiting for their first `Resource limit exceeded` crash.
+
+Bump `pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.0"`.
+
 ## [0.10.0] — 2026-04-27
 
 Promotes four Harper-private defence layers (`L10`-`L13`) to the public

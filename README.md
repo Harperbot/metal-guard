@@ -6,7 +6,20 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version: v0.10.0** — see [CHANGELOG.md](CHANGELOG.md) for release history and per-feature rationale.
+**Current version: v0.11.0** — see [CHANGELOG.md](CHANGELOG.md) for release history and per-feature rationale.
+
+### What's in v0.11
+
+Built on the 2026-04-27 community sweep (mlx-lm#1185 / #1206 / mlx-vlm#1064 / omlx#578 / #862 / #902):
+
+- **`error_classifier`** — central regex table for **6 distinct error severities**: `kernel_panic` / `process_abort` / `command_buffer_oom` / `gpu_hang` / `gpu_page_fault` / `descriptor_leak`. `SubprocessCrashError` now exposes `.error_class` + `.recovery_hint` for caller routing.
+- **L10b — process-abort scanner** — `scan_recent_aborts(24h)` sibling to `scan_recent_panics(72h)`. Aborts are non-rebooting failures; counted separately so they don't trip the kernel-panic lockout. `CooldownVerdict.abort_count_24h` exposed for dashboards.
+- **L13b — Apple GPU family detection** — `apple_gpu_family()` reads `mx.device_info()` and maps `applegpu_g13`/`g14`/`g15`/`g16`/`g17` → `M1`/`M2`/`M3`/`M4`/`M5`. Surfaces `resource_limit` (mlx-lm#1185 descriptor cap, 499000 on M1 Ultra).
+- **L14 — descriptor-leak heuristic** — `ResourceTracker(cold_restart_after=4000)` tracks inferences-since-cold-restart so callers can pre-emptively `shutdown()` + spawn new subprocess before hitting the descriptor limit. `mx.clear_cache()` doesn't release descriptor handles; only subprocess respawn does.
+- **`breadcrumb_with_meta(tag, payload, **meta)`** — structured breadcrumb format `[ts] TAG: payload | k=v k=v` for richer postmortem forensics. L11 orphan parser updated to lazy regex (backward-compat with legacy `breadcrumb()`).
+- **`KNOWN_PANIC_MODELS` schema upgrade** — adds `tier` (panic / abort / degradation), `error_classes[]` (multiple modes per model + per-GPU-family confirmation), `verified_safe_alternative`. New helpers: `check_known_panic_model_for_gpu(model, gpu_family="M5")` / `models_by_tier()` / `models_affecting_gpu_family()`.
+- **4 new registry entries** covering Qwen3.5/Qwen3.6/Qwen3-VL family across M4 / M5 hardware.
+- **Hotfix**: PEP 639 license-classifier conflict in `pyproject.toml` that blocked every `pip install` since v0.9.0.
 
 ### What's in v0.10
 
@@ -127,13 +140,13 @@ This affects any workflow that loads and unloads multiple MLX models in sequence
 Installs from a tagged release — gives you the `metal-guard` and `mlx-safe-python` console scripts plus the `metal_guard` Python module:
 
 ```bash
-pip install "git+https://github.com/Harperbot/metal-guard.git@v0.10.0"
+pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.0"
 ```
 
 After install:
 
 ```bash
-metal-guard --version          # → metal-guard 0.10.0
+metal-guard --version          # → metal-guard 0.11.0
 metal-guard panic-gate         # L10 cooldown verdict
 metal-guard status             # full snapshot
 mlx-safe-python -c "import torch"   # interactive shell guard
@@ -148,7 +161,7 @@ To upgrade to a future release: `pip install --upgrade "git+https://github.com/H
 ```bash
 mkdir -p ~/lib/metal-guard
 curl -L -o ~/lib/metal-guard/metal_guard.py \
-  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.10.0/metal_guard.py
+  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.11.0/metal_guard.py
 ```
 
 Then in your code:
@@ -182,7 +195,7 @@ $ metal-guard panic-gate
 🟢 PROCEED  no recent IOGPU panics
   24h=0 72h=0
 $ metal-guard status
-metal-guard 0.10.0  🟢 OK
+metal-guard 0.11.0  🟢 OK
   mode        defensive — defensive mode (default)
   panics      0 in last 72h
   ...
@@ -238,7 +251,7 @@ metal_guard.start_kv_cache_monitor(headroom_gb=config["kv_headroom_gb"])
 MetalGuard is organised as **defence layers (L1–L13)** plus a set of
 **preventive helpers (R-series)** and the **`KNOWN_PANIC_MODELS` registry**.
 Every feature is available from the single `metal_guard` module — install via
-`pip install "git+https://github.com/Harperbot/metal-guard.git@v0.10.0"` or
+`pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.0"` or
 drop `metal_guard.py` in your `PYTHONPATH` (see [Installation](#installation) above). See [CHANGELOG.md](CHANGELOG.md) for when
 each layer landed and the incident that motivated it.
 
