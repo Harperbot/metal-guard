@@ -5,6 +5,30 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.1] — 2026-04-28
+
+Hotfix: declare explicit `py-modules` so setuptools doesn't refuse
+flat-layout discovery.
+
+### Fixed
+
+- **`pyproject.toml`** — modern setuptools (≥80) refuses flat-layout
+  auto-discovery when more than one top-level `.py` module exists in
+  the repo root: `error: Multiple top-level modules discovered in a
+  flat-layout: ['metal_guard', 'metal_guard_cli']`. v0.10 had the same
+  layout but install was already blocked by the PEP 639 license
+  conflict, so this second error was masked. v0.11.0 fixed PEP 639,
+  exposing the auto-discovery refusal as the next blocker. Added
+  explicit `[tool.setuptools] py-modules = ["metal_guard",
+  "metal_guard_cli"]` so build is deterministic.
+
+Verified locally: `pip install -e .` in a fresh venv now resolves +
+`metal-guard --version` returns `0.11.1`. CI matrix (py3.11/3.12/3.13
+on Ubuntu + macOS) should now produce the first green build since
+v0.9.0.
+
+Bump: `pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.1"`.
+
 ## [0.11.0] — 2026-04-28
 
 Release combining the v0.10.1 install hotfix with second-wave Harper-

@@ -6,7 +6,7 @@ Apple Silicon 上 [MLX](https://github.com/ml-explore/mlx) 的 GPU 安全層。
 
 防止 MLX 推論時 Metal 驅動程式 bug 造成的 kernel panic 與 OOM 崩潰 —— 尤其是多模型 pipeline、長時間運行的 server、以及大量 tool calling 的 agent 框架。
 
-**當前版本：v0.11.0** — 發行歷史與每個功能的背景見 [CHANGELOG.md](CHANGELOG.md)。
+**當前版本：v0.11.1** — 發行歷史與每個功能的背景見 [CHANGELOG.md](CHANGELOG.md)。
 
 ### v0.10 帶來什麼
 
@@ -124,13 +124,13 @@ panic(cpu 4 caller 0xfffffe0032a550f8):
 從 tag release 裝 —— 會拿到 `metal-guard` 跟 `mlx-safe-python` 兩個 console scripts 跟 `metal_guard` Python module：
 
 ```bash
-pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.0"
+pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.1"
 ```
 
 裝完：
 
 ```bash
-metal-guard --version          # → metal-guard 0.11.0
+metal-guard --version          # → metal-guard 0.11.1
 metal-guard panic-gate         # L10 cooldown 判斷
 metal-guard status             # 完整 snapshot
 mlx-safe-python -c "import torch"   # 互動 shell 守衛
@@ -145,7 +145,7 @@ mlx-safe-python -c "import torch"   # 互動 shell 守衛
 ```bash
 mkdir -p ~/lib/metal-guard
 curl -L -o ~/lib/metal-guard/metal_guard.py \
-  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.11.0/metal_guard.py
+  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.11.1/metal_guard.py
 ```
 
 程式裡：
@@ -179,7 +179,7 @@ $ metal-guard panic-gate
 🟢 PROCEED  no recent IOGPU panics
   24h=0 72h=0
 $ metal-guard status
-metal-guard 0.11.0  🟢 OK
+metal-guard 0.11.1  🟢 OK
   mode        defensive — defensive mode (default)
   panics      0 in last 72h
   ...

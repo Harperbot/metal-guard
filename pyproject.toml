@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "metal-guard"
-version = "0.11.0"
+version = "0.11.1"
 description = "GPU safety layer for MLX on Apple Silicon — prevents kernel panics from Metal driver bugs, includes community-curated KNOWN_PANIC_MODELS registry"
 readme = "README.md"
 license = "MIT"
@@ -43,6 +43,14 @@ Repository = "https://github.com/Harperbot/metal-guard"
 Issues = "https://github.com/Harperbot/metal-guard/issues"
 Changelog = "https://github.com/Harperbot/metal-guard/blob/main/CHANGELOG.md"
 "Known Panic Models" = "https://github.com/Harperbot/metal-guard#-community-panic-registry--known_panic_models"
+
+[tool.setuptools]
+# v0.11.1 hotfix: explicit py-modules list. setuptools 80+ refuses flat-
+# layout auto-discovery when >1 top-level .py module exists ("Multiple
+# top-level modules discovered in a flat-layout"). v0.10 had the same
+# layout but install was already blocked by PEP 639 so this error was
+# masked. v0.11.0 fixed PEP 639 and exposed this second failure.
+py-modules = ["metal_guard", "metal_guard_cli"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

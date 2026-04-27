@@ -6,7 +6,7 @@ Apple Silicon 上で [MLX](https://github.com/ml-explore/mlx) を動かすため
 
 MLX 推論中に Metal ドライバーのバグが引き起こすカーネルパニックや OOM クラッシュを防止します —— 特にマルチモデルパイプライン、長時間稼働サーバー、ツール呼び出しが多いエージェントフレームワークを想定しています。
 
-**現在のバージョン：v0.11.0** — リリース履歴と各機能の背景は [CHANGELOG.md](CHANGELOG.md) を参照してください。
+**現在のバージョン：v0.11.1** — リリース履歴と各機能の背景は [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
 ### v0.10 で追加されたもの
 
@@ -124,13 +124,13 @@ panic(cpu 4 caller 0xfffffe0032a550f8):
 タグリリースからインストール —— `metal-guard` と `mlx-safe-python` の console scripts に加え、`metal_guard` Python モジュールが入ります：
 
 ```bash
-pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.0"
+pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.1"
 ```
 
 インストール後：
 
 ```bash
-metal-guard --version          # → metal-guard 0.11.0
+metal-guard --version          # → metal-guard 0.11.1
 metal-guard panic-gate         # L10 cooldown 判定
 metal-guard status             # フルスナップショット
 mlx-safe-python -c "import torch"   # 対話シェルガード
@@ -145,7 +145,7 @@ mlx-safe-python -c "import torch"   # 対話シェルガード
 ```bash
 mkdir -p ~/lib/metal-guard
 curl -L -o ~/lib/metal-guard/metal_guard.py \
-  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.11.0/metal_guard.py
+  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.11.1/metal_guard.py
 ```
 
 コード内で：
@@ -179,7 +179,7 @@ $ metal-guard panic-gate
 🟢 PROCEED  no recent IOGPU panics
   24h=0 72h=0
 $ metal-guard status
-metal-guard 0.11.0  🟢 OK
+metal-guard 0.11.1  🟢 OK
   mode        defensive — defensive mode (default)
   panics      0 in last 72h
   ...
