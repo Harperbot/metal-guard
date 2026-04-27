@@ -494,9 +494,14 @@ class TestPeriodicFlush:
         _mock_mlx.get_active_memory.return_value = 10_000_000_000
         _mock_mlx.get_peak_memory.return_value = 30_000_000_000  # >50% to trigger
         guard.start_periodic_flush(interval_secs=0.05)
-        time.sleep(0.15)  # Wait for at least one tick
+        # Poll up to 3s for at least one tick (CI runners are slow,
+        # 0.15s blind sleep is flaky on macos-latest under load).
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if _mock_mlx.clear_cache.call_count >= 1:
+                break
+            time.sleep(0.05)
         guard.stop_periodic_flush()
-        # flush_gpu should have been called at least once
         assert _mock_mlx.clear_cache.call_count >= 1
 
     def test_flush_skips_when_threads_active(self, guard, _mock_mlx):
@@ -536,9 +541,13 @@ class TestWatchdog:
         _mock_mlx.get_active_memory.return_value = 36_000_000_000  # 75% of 48GB
         _mock_mlx.get_peak_memory.return_value = 36_000_000_000
         guard.start_watchdog(interval_secs=0.05, warn_pct=70.0, critical_pct=85.0)
-        time.sleep(0.15)
+        # Poll up to 3s for at least one tick (CI runners are slow).
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if _mock_mlx.clear_cache.call_count >= 1:
+                break
+            time.sleep(0.05)
         guard.stop_periodic_flush()
-        # Should have called flush (warn level)
         assert _mock_mlx.clear_cache.call_count >= 1
 
     def test_watchdog_critical_triggers_callback(self, guard, _mock_mlx):
@@ -570,9 +579,13 @@ class TestWatchdog:
         _mock_mlx.get_active_memory.side_effect = drifting_active
         _mock_mlx.get_peak_memory.return_value = 40_000_000_000
         guard.start_watchdog(interval_secs=0.05, warn_pct=70.0, critical_pct=85.0)
-        time.sleep(0.2)
+        # Poll up to 3s for baseline to be set (CI runners are slow).
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if guard._watchdog_baseline is not None:
+                break
+            time.sleep(0.05)
         guard.stop_periodic_flush()
-        # Baseline should have been set
         assert guard._watchdog_baseline is not None
 
 

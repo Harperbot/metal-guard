@@ -5,6 +5,22 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.5] — 2026-04-28
+
+CI flakiness hotfix. No module / CLI / API changes — same code as v0.11.4.
+
+### Fixed
+
+- **`tests/test_metal_guard.py`** — three timing-based tests
+  (`test_flush_executes`, `test_watchdog_warns_on_high_memory`,
+  `test_watchdog_tracks_drift`) used a blind `time.sleep(0.15)` to wait
+  for a 0.05s-interval thread tick. On `macos-latest` GitHub Actions
+  runners under load, that 150 ms window wasn't long enough for the
+  thread to fire, producing intermittent `assert call_count >= 1`
+  failures on Python 3.12/3.13 in v0.11.4's CI run. Replaced with
+  poll-up-to-3s loops that exit early on success. Local 338-test suite
+  still completes in 5.69s.
+
 ## [0.11.4] — 2026-04-28
 
 Community panic-registry expansion + new MLX-version blocklist mechanism.
