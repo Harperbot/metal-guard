@@ -85,7 +85,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.11.1"
+__version__ = "0.11.2"
 
 log = logging.getLogger("metal_guard")
 
