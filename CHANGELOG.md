@@ -5,6 +5,41 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.7] — 2026-04-28
+
+Variant policy clarification on the canonical Gemma 4 31B kernel-panic
+entry. No matching-logic change; documentation + advisory text only.
+
+### Why this matters
+
+The 2026-04-28 ecosystem sweep surfaced multiple community forks and
+re-quantizations of `gemma-4-31b` (PLE-safe builds, RotorQuant-tuned
+variants, TurboQuant KV-cache variants, custom bitwidths). Because the
+underlying defect is in the **Apple IOGPU kext** — below the model
+layer — these forks are presumed to share the same panic surface, but
+each variant is unverified on a per-hardware/workload basis.
+
+metal-guard's policy is to treat **only the upstream-vendor model id**
+as confirmed-panic in `KNOWN_PANIC_MODELS`. We do **not** auto-match
+variant model_ids by prefix or substring. Adopters who hit a panic on
+a specific fork should file a community contribution with their own
+hardware + workload combo as a separate registry entry.
+
+### Added
+
+- **`variant_policy: "confirmed_for_upstream_id_only"`** field on the
+  `mlx-community/gemma-4-31b-it-8bit` entry.
+- **`presumed_affected_variants`** narrative field on the same entry,
+  documenting that any fork or re-quant of `gemma-4-31b` at any
+  bitwidth is presumed to inherit the panic surface, with explicit
+  examples (PLE-safe, RotorQuant, TurboQuant-KV).
+
+### Not changed
+
+- Matching logic in `check_known_panic_model()` — still exact model_id
+  match.
+- 345 existing tests continue to pass; no behavior regression.
+
 ## [0.11.6] — 2026-04-28
 
 LoRA-focused panic registry expansion driven by an afternoon ecosystem

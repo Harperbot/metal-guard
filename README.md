@@ -6,7 +6,7 @@ GPU safety layer for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon.
 
 Prevents kernel panics and OOM crashes caused by Metal driver bugs when running MLX inference — especially multi-model pipelines, long-running servers, and agent frameworks with heavy tool calling.
 
-**Current version: v0.11.6** — see [CHANGELOG.md](CHANGELOG.md) for release history and per-feature rationale.
+**Current version: v0.11.7** — see [CHANGELOG.md](CHANGELOG.md) for release history and per-feature rationale.
 
 ### What's in v0.11
 
@@ -140,13 +140,13 @@ This affects any workflow that loads and unloads multiple MLX models in sequence
 Installs from a tagged release — gives you the `metal-guard` and `mlx-safe-python` console scripts plus the `metal_guard` Python module:
 
 ```bash
-pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.6"
+pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.7"
 ```
 
 After install:
 
 ```bash
-metal-guard --version          # → metal-guard 0.11.6
+metal-guard --version          # → metal-guard 0.11.7
 metal-guard panic-gate         # L10 cooldown verdict
 metal-guard status             # full snapshot
 mlx-safe-python -c "import torch"   # interactive shell guard
@@ -161,7 +161,7 @@ To upgrade to a future release: `pip install --upgrade "git+https://github.com/H
 ```bash
 mkdir -p ~/lib/metal-guard
 curl -L -o ~/lib/metal-guard/metal_guard.py \
-  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.11.6/metal_guard.py
+  https://raw.githubusercontent.com/Harperbot/metal-guard/v0.11.7/metal_guard.py
 ```
 
 Then in your code:
@@ -195,7 +195,7 @@ $ metal-guard panic-gate
 🟢 PROCEED  no recent IOGPU panics
   24h=0 72h=0
 $ metal-guard status
-metal-guard 0.11.6  🟢 OK
+metal-guard 0.11.7  🟢 OK
   mode        defensive — defensive mode (default)
   panics      0 in last 72h
   ...
@@ -251,7 +251,7 @@ metal_guard.start_kv_cache_monitor(headroom_gb=config["kv_headroom_gb"])
 MetalGuard is organised as **defence layers (L1–L13)** plus a set of
 **preventive helpers (R-series)** and the **`KNOWN_PANIC_MODELS` registry**.
 Every feature is available from the single `metal_guard` module — install via
-`pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.6"` or
+`pip install "git+https://github.com/Harperbot/metal-guard.git@v0.11.7"` or
 drop `metal_guard.py` in your `PYTHONPATH` (see [Installation](#installation) above). See [CHANGELOG.md](CHANGELOG.md) for when
 each layer landed and the incident that motivated it.
 

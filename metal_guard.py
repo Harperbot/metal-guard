@@ -85,7 +85,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.11.6"
+__version__ = "0.11.7"
 
 log = logging.getLogger("metal_guard")
 
@@ -4987,6 +4987,24 @@ KNOWN_PANIC_MODELS: dict[str, dict[str, Any]] = {
             "repeat panics with metal-guard fully engaged, switch backend "
             "(Ollama / llama.cpp) or pivot to MoE variant "
             "(e.g. mlx-community/gemma-4-26b-a4b-it-4bit)."
+        ),
+        # v0.11.7: variant policy — only the upstream-vendor build is
+        # treated as confirmed-panic. Re-quantized / re-packaged forks
+        # (PLE-safe, RotorQuant-tuned, TurboQuant-KV variants, custom
+        # bitwidths) are PRESUMED to share the same Apple IOGPU bug
+        # surface because the kernel-side defect is below the model
+        # layer — but each variant is unverified individually. metal-
+        # guard does NOT auto-match variant model_ids; community
+        # contributors who confirm a panic on a specific variant should
+        # add a separate KNOWN_PANIC_MODELS entry.
+        "variant_policy": "confirmed_for_upstream_id_only",
+        "presumed_affected_variants": (
+            "Any fork or re-quantization of gemma-4-31b at any bitwidth "
+            "is presumed to inherit the panic surface (Apple IOGPU "
+            "kext bug, not model-layer). Examples observed in the wild "
+            "include PLE-safe / RotorQuant / TurboQuant-KV variants. "
+            "Treat as panic-prone until proven otherwise on your "
+            "specific hardware + workload."
         ),
         "upstream": [
             "https://github.com/ml-explore/mlx/issues/3186",
