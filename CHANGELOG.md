@@ -5,6 +5,49 @@ All notable changes to **metal-guard** are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.11.6] — 2026-04-28
+
+LoRA-focused panic registry expansion driven by an afternoon ecosystem
+sweep that surfaced three new patterns: an mlx-lm version with three
+concurrent server bugs, a Gemma 4 LoRA → Swift deployment incompat,
+and the long-standing IOGPU watchdog kill of LoRA-with-display-active.
+
+### Added
+
+- **`MLX_LM_VERSION_BLOCKLIST`** — separate dict from
+  `MLX_VERSION_BLOCKLIST` since mlx-lm is versioned independently from
+  mlx core. First entry: `mlx-lm == 0.31.3` flagged `high` for the
+  three concurrent bugs ([#1208](https://github.com/ml-explore/mlx-lm/issues/1208) /
+  [#1215](https://github.com/ml-explore/mlx-lm/issues/1215) /
+  [#1206](https://github.com/ml-explore/mlx-lm/issues/1206)).
+- **`check_mlx_lm_version_blocked(version)`** — advisory query mirror
+  of `check_mlx_version_blocked`.
+- **`WORKLOAD_ADVISORIES`** — new dict for panics caused by host
+  environment, not the model. First entry:
+  `lora_with_display_active` covering [mlx#3267](https://github.com/ml-explore/mlx/issues/3267)
+  IOGPU watchdog kill (`kIOGPUCommandBufferCallbackErrorImpactingInteractivity`)
+  on macOS 26.2 / 26.3.1, 4/4 reproducible. Workaround: display sleep
+  + `caffeinate -s`. metal-guard L7 subprocess isolation does NOT help
+  here — the kill is at IOGPU layer above the process boundary.
+- **`check_workload_advisory(workload_id)`** — string-keyed advisory
+  query for callers that wire training launchers.
+- **`KNOWN_PANIC_MODELS["workflow:gemma4-fused-via-mlx_lm.fuse"]`**
+  — `tier=degradation`, new `fuse_round_trip_swift_incompatible` error
+  class for mlx-lm#1210 (Gemma 4 attention shape: Python-side writes
+  k_proj/v_proj only on `has_kv` layers, mlx-swift-lm expects every
+  layer). Affects LoRA → fuse → Swift deploy paths only.
+
+### Tests
+
+- 7 new tests covering both new dicts (schema sanity + lookup
+  positive/negative), the workload advisory string-keyed access, and
+  the Gemma 4 entry presence.
+- Total suite: **345 passed in 5.68s** (was 338).
+
+### No breaking changes
+
+All v0.11.5 callers continue to work.
+
 ## [0.11.5] — 2026-04-28
 
 CI flakiness hotfix. No module / CLI / API changes — same code as v0.11.4.

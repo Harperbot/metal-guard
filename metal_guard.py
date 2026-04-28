@@ -85,7 +85,7 @@ from multiprocessing.connection import Connection
 from pathlib import Path
 from typing import Any, Callable, Generator, Iterator, Tuple, TypeVar
 
-__version__ = "0.11.5"
+__version__ = "0.11.6"
 
 log = logging.getLogger("metal_guard")
 
@@ -5274,6 +5274,46 @@ KNOWN_PANIC_MODELS: dict[str, dict[str, Any]] = {
         "upstream": ["https://github.com/ml-explore/mlx-lm/issues/1197"],
     },
 
+    "workflow:gemma4-fused-via-mlx_lm.fuse": {
+        "tier": "degradation",
+        "error_classes": [
+            {
+                "type": "fuse_round_trip_swift_incompatible",
+                "signature": (
+                    "Gemma 4 attention-shape divergence: fused checkpoint "
+                    "fails to load in mlx-swift-lm"
+                ),
+                "first_seen_via": "ml-explore/mlx-lm#1210",
+                "hardware": ["any"],
+                "gpu_family": ["M1", "M2", "M3", "M4", "M5"],
+                "workload": (
+                    "mlx_lm.fuse round-trip: LoRA adapter merged into "
+                    "Gemma 4 base, deployed via mlx-swift-lm consumer"
+                ),
+                "mitigation": (
+                    "mlx-lm Python only writes k_proj / v_proj on layers "
+                    "with has_kv=True; mlx-swift-lm expects them on every "
+                    "layer. Until upstream alignment, deploy fused Gemma "
+                    "4 LoRAs only via Python mlx-lm consumers (not Swift)."
+                ),
+            },
+        ],
+        "verified_safe_alternative": None,
+        "first_observed": "2026-04-27",
+        "last_observed": "2026-04-27",
+        "panic_signature": (
+            "Gemma 4 attention-shape divergence: fused checkpoint "
+            "fails to load in mlx-swift-lm"
+        ),
+        "reproductions": [],
+        "community": ["ml-explore/mlx-lm#1210 (fuse round-trip Swift incompat)"],
+        "recommendation": (
+            "Skip mlx_lm.fuse for Gemma 4 LoRA → Swift deployment paths "
+            "until #1210 lands. Python-side consumers unaffected."
+        ),
+        "upstream": ["https://github.com/ml-explore/mlx-lm/issues/1210"],
+    },
+
     "mlx-community/kimi-k2.5": {
         "tier": "abort",
         "error_classes": [
@@ -5323,6 +5363,81 @@ MLX_VERSION_BLOCKLIST: dict[str, dict[str, Any]] = {
         "workaround": "Pin mlx==0.31.1 or wait for 0.31.4+.",
     },
 }
+
+# v0.11.6: mlx-lm version blocklist (separate from mlx core blocklist).
+# mlx-lm and mlx are versioned independently; a bad mlx-lm release can
+# crash callers even when mlx core is fine.
+MLX_LM_VERSION_BLOCKLIST: dict[str, dict[str, Any]] = {
+    "0.31.3": {
+        "severity": "high",
+        "error_class": "process_abort",
+        "signature": (
+            "Multiple server-lifecycle bugs (3 distinct crash-loops "
+            "filed in 24h on this version)"
+        ),
+        "reason": (
+            "mlx-lm 0.31.3 has three concurrent server-crash issues: "
+            "ml-explore/mlx-lm#1208 (load_default → snapshot_download → "
+            "thread_map at interpreter shutdown), #1215 (prompt-cache "
+            "exact-hit empties segments → IndexError in insert_segments), "
+            "and #1206 / #1185 LoRA OOM patterns also active in this "
+            "release line. Avoid for production server workloads."
+        ),
+        "first_observed": "2026-04-27",
+        "upstream": [
+            "https://github.com/ml-explore/mlx-lm/issues/1208",
+            "https://github.com/ml-explore/mlx-lm/issues/1215",
+            "https://github.com/ml-explore/mlx-lm/issues/1206",
+        ],
+        "workaround": "Pin mlx-lm==0.31.2 or wait for 0.31.4+.",
+    },
+}
+
+
+def check_mlx_lm_version_blocked(version: str) -> dict[str, Any] | None:
+    """Return blocklist entry for an mlx-lm library version, else ``None``.
+
+    Mirrors :func:`check_mlx_version_blocked` but for the separately-
+    versioned `mlx-lm` package. Caller policy: refuse / downgrade / warn.
+    """
+    return MLX_LM_VERSION_BLOCKLIST.get(version)
+
+
+# v0.11.6: workload-level advisories (orthogonal to model and library
+# version). Some panics are caused by host environment, not the model.
+WORKLOAD_ADVISORIES: dict[str, dict[str, Any]] = {
+    "lora_with_display_active": {
+        "severity": "high",
+        "error_class": "gpu_watchdog_kill",
+        "signature": "kIOGPUCommandBufferCallbackErrorImpactingInteractivity",
+        "reason": (
+            "Apple's IOGPU watchdog kills LoRA training when it competes "
+            "for GPU time with the active display. Reproduces 4/4 on "
+            "macOS 26.2 / 26.3.1. Affects ALL LoRA workloads regardless "
+            "of model — orthogonal to KNOWN_PANIC_MODELS."
+        ),
+        "first_observed": "2026-04-12",
+        "upstream": ["https://github.com/ml-explore/mlx/issues/3267"],
+        "workaround": (
+            "Run training with display sleep active, or via SSH from "
+            "another machine. `caffeinate -s` keeps the system awake "
+            "without forcing the display on. Alternatively, dim brightness "
+            "to zero so WindowServer yields GPU. metal-guard L7 subprocess "
+            "isolation does NOT help — the kill is at IOGPU layer above "
+            "process boundary."
+        ),
+    },
+}
+
+
+def check_workload_advisory(workload_id: str) -> dict[str, Any] | None:
+    """Return advisory for a known panic-prone workload, else ``None``.
+
+    Workload IDs are stable strings like ``"lora_with_display_active"``.
+    Callers can wire this into training launchers to surface mitigation
+    advice before kicking off a job that's likely to die.
+    """
+    return WORKLOAD_ADVISORIES.get(workload_id)
 
 
 def check_mlx_version_blocked(version: str) -> dict[str, Any] | None:

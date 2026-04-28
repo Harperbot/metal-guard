@@ -467,3 +467,64 @@ def test_v0114_silent_corruption_error_class_recorded():
     e = mg.KNOWN_PANIC_MODELS["mlx-community/Qwen3.6-35B-A3B-VLM-MTP-8bit"]
     types = {ec["type"] for ec in e["error_classes"]}
     assert "silent_corruption" in types
+
+
+# ─── v0.11.6: mlx-lm blocklist + workload advisories + Gemma 4 fuse entry ─
+
+
+def test_mlx_lm_version_blocklist_known_entry():
+    block = mg.check_mlx_lm_version_blocked("0.31.3")
+    assert block is not None
+    assert block["severity"] == "high"
+    assert "1208" in " ".join(block["upstream"]) or "1215" in " ".join(block["upstream"])
+
+
+def test_mlx_lm_version_blocklist_unknown_returns_none():
+    assert mg.check_mlx_lm_version_blocked("0.31.2") is None
+    assert mg.check_mlx_lm_version_blocked("0.31.4") is None
+
+
+def test_mlx_lm_version_blocklist_schema_sanity():
+    required = {"severity", "error_class", "signature", "reason",
+                "first_observed", "upstream", "workaround"}
+    allowed_severity = {"critical", "high", "medium"}
+    for ver, e in mg.MLX_LM_VERSION_BLOCKLIST.items():
+        missing = required - set(e.keys())
+        assert not missing, f"mlx-lm {ver}: blocklist entry missing {missing}"
+        assert e["severity"] in allowed_severity, (
+            f"mlx-lm {ver}: severity={e['severity']!r}"
+        )
+        assert e["upstream"], f"mlx-lm {ver}: upstream must be non-empty"
+
+
+def test_workload_advisory_lora_display():
+    a = mg.check_workload_advisory("lora_with_display_active")
+    assert a is not None
+    assert a["severity"] == "high"
+    assert "watchdog" in a["error_class"]
+    assert "caffeinate" in a["workaround"].lower()
+
+
+def test_workload_advisory_unknown_returns_none():
+    assert mg.check_workload_advisory("not_a_real_workload") is None
+    assert mg.check_workload_advisory("") is None
+
+
+def test_workload_advisory_schema_sanity():
+    required = {"severity", "error_class", "signature", "reason",
+                "first_observed", "upstream", "workaround"}
+    allowed_severity = {"critical", "high", "medium"}
+    for wid, e in mg.WORKLOAD_ADVISORIES.items():
+        missing = required - set(e.keys())
+        assert not missing, f"workload {wid}: advisory entry missing {missing}"
+        assert e["severity"] in allowed_severity, (
+            f"workload {wid}: severity={e['severity']!r}"
+        )
+
+
+def test_v0116_gemma4_fuse_entry_present():
+    assert "workflow:gemma4-fused-via-mlx_lm.fuse" in mg.KNOWN_PANIC_MODELS
+    e = mg.KNOWN_PANIC_MODELS["workflow:gemma4-fused-via-mlx_lm.fuse"]
+    assert e["tier"] == "degradation"
+    types = {ec["type"] for ec in e["error_classes"]}
+    assert "fuse_round_trip_swift_incompatible" in types
