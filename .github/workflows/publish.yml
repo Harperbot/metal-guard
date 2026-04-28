@@ -1,9 +1,10 @@
 name: Publish to PyPI
 
 on:
-  push:
-    tags:
-      - 'v*'
+  # Tag-triggered publish disabled until PyPI Trusted Publisher is set
+  # up. To enable, restore the `push.tags: [v*]` block and confirm the
+  # pending publisher is registered on pypi.org for this repo + workflow
+  # + environment (`pypi`).
   workflow_dispatch:
 
 jobs:
